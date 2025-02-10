@@ -1,0 +1,783 @@
+---
+title: "01 Trial Data Curation"
+output: html_document
+date: "2024-02-07"
+---
+
+
+# About
+mvGWAS project
+Review and QC of cassava breeding trial data
+-   Inputs: 
+        - Field trial data from Casssavabase, HarvestPlus accessions only: `./data/phenotypes_yellowGWAS_2023-10-02CBdownload.csv `
+        - Field trial data from Casssavabase, including CASS accessions: `./data/2024-02-01T130213phenotype_download.csv`
+-   Outputs: BLUPs and Broad-sense Heritability estimates from cleaned field trial data (outliers removed):
+        - BLUPs: `./data/alltrait_drgBLUPs_HP.RDS` and `./data/alltrait_drgBLUPs_CASS.RDS`
+        - H2: `./data/alltrait_H2_HP.RDS` and `./data/alltrait_H2_CASS.RDS`
+        - Trait descriptions table
+        - Trial descriptions table
+        - Trait heritability table
+
+
+Phenotypic data QC is based on Marnin Wolfe's [NextGen Cassava GS pipeline](https://github.com/wolfemd/IITA_2021GS/) using tools from the `genomicMateSelectR` package.
+
+# Setup
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse); library(magrittr); library(genomicMateSelectR); library(MASS); library(asreml); library(scales)
+#devtools::install_github("wolfemd/genomicMateSelectR", ref = 'master') 
+
+project_path <- "/workdir/ssv42/mvGWAS/"
+setwd(project_path)
+set.seed(14850)
+```
+
+
+# Cassavabase download information
+
+1.  [Cassavabase search wizard](https://www.cassavabase.org/breeders/search) was used to make lists. I downloaded phenotypes and meta-data for trials in the list using the **Manage** --\> **Download** page [here](https://www.cassavabase.org/breeders/download).
+2.  Trial data including CASS accessions: Selected trials which contained at least four of the genotyped accessions; locations IB, IK, UBI, UMU, MOK, or ILO; Years 2013-2023. Those trials were put into list 'yellowGWAS23_trials_updated' (473 trials). Download saved as `./data/trial_data/2024-02-01T130213phenotype_download.csv`.
+3.  Trial data with only the HarvestPlus accessions: Selected trials with names containing the keywords `yrt`, `highTC`, `TC`, or `mixed` and/or accessions in the list of genotyped accessions `yellow_GWAS_23`. Those trials were put into list `yellow_GWAS_23_trials` (# trials). Download saved as `./data/phenotypes_yellowGWAS_2023-10-02CBdownload.csv`.
+
+# Data curation
+
+Read in data and select analysis options
+```{r}
+#Select dataset
+dataset <- "CASS" #"HP" #or
+print(paste0("working with ", dataset, " data"))
+
+#Select filtering method
+filter_trial_byH2 <- FALSE
+
+#Select trait
+TCtrait <- "TCICHK"
+
+
+if(dataset=="CASS"){
+  rawtrialdata <- read.csv("./data/2024-02-01T130213phenotype_download.csv")
+  samplenames <- read.table("./data/genotypenames_CASS.txt")[,1]
+  
+} else if(dataset=="HP"){
+  rawtrialdata <- read.csv("./data/phenotypes_yellowGWAS_2023-10-02CBdownload.csv")
+  samplenames <- na.exclude(c(read.csv("./data/platecoordinates_HP.csv")[,"UniqueSampleID"], "IITA-TMS-IBA070593")[-c(357:384)]) #drop ITH names
+}
+```
+
+Select traits of interest:
+```{r, warning=FALSE, message=FALSE}
+#dataset specific traitnames
+if(dataset=="CASS"){
+  lchromo <- "L.chromometer.of.fresh.root.CO_334.0002065"
+  achromo <- "A.chromometer.value.of.fresh.root.CO_334.0002066"
+  bchromo <- "B.chromometer.value.of.fresh.root.CO_334.0002064"
+} else if(dataset=="HP"){
+  lchromo <- "L.chromometer.value.CO_334.0002065"
+  achromo <- "a.chromometer.value.CO_334.0002066"
+  bchromo <- "b.chromometer.value.CO_334.0002064"
+}
+
+
+#define trait abbreviations
+traitabbrevs <- tribble(~TraitAbbrev,~TraitName,
+        "TCICHK",     'total.carotenoid.by.iCheck.method.CO_334.0000162',
+        "TCHART",     'total.carotenoid.by.chart.1.8.CO_334.0000161',
+        "DM",         'dry.matter.content.percentage.CO_334.0000092', 
+        "DYLD",       'dry.yield.CO_334.0000014',
+        "STRCH",      'starch.content.percentage.CO_334.0000071',
+        "RTWT",       'fresh.storage.root.weight.per.plot.CO_334.0000012',
+        "DMSPGRAV",   'dry.matter.content.by.specific.gravity.method.CO_334.0000160',
+        "NOSTK",      'number.of.planted.stakes.per.plot.counting.CO_334.0000159',
+        "POUND",      'poundability.assessment.0.4.CO_334.0000074',
+        "PLARCH",     'plant.architecture.visual.rating.1.5.CO_334.0000099',
+        "TOPYLD",     'top.yield.CO_334.0000017',
+        "CGMS1",      'cassava.green.mite.severity.first.evaluation.CO_334.0000189',
+        "CGMS2",      'cassava.green.mite.severity.second.evaluation.CO_334.0000190',
+        "LODGE",      'proportion.lodged.plants.in.percentage.CO_334.0000094',
+        "BRNHT",      'first.apical.branch.height.measurement.in.cm.CO_334.0000106',
+        "BRLVLS",     'branching.level.counting.CO_334.0000079',
+        "SPRTPERC",   'sprouting.proportion.CO_334.0000008',
+        "HI",         'harvest.index.variable.CO_334.0000015',
+        "SHTWT",      'fresh.shoot.weight.measurement.in.kg.per.plot.CO_334.0000016',
+        "RTNRT",      'rotted.storage.root.counting.CO_334.0000084',
+        "FRYLD",      'fresh.root.yield.CO_334.0000013',
+        "RTNO",       'root.number.per.plot.counting.CO_334.0000011',
+        "NOHAV",      'plant.stands.harvested.counting.CO_334.0000010',
+        "CMD1S",      "cassava.mosaic.disease.severity.1.month.evaluation.CO_334.0000191",
+        "CMD3S",      "cassava.mosaic.disease.severity.3.month.evaluation.CO_334.0000192",
+        "CMD3I",      'cassava.mosaic.disease.incidence.3.month.evaluation.CO_334.0000196',
+        "CMD6S",      "cassava.mosaic.disease.severity.6.month.evaluation.CO_334.0000194",
+        "CMD9S",      "cassava.mosaic.disease.severity.9.month.evaluation.CO_334.0000193",
+        "CBB3I",      'cassava.bacterial.blight.incidence.3.month.evaluation.CO_334.0000178',
+        "CBB3S",      'cassava.bacterial.blight.severity.3.month.evaluation.CO_334.0000175',
+        "CAD6I",      'cassava.anthractnose.disease.incidence.in.6.month.CO_334.0000181',
+        "CAD6S",      'cassava.anthractnose.disease.severity.in.6.month.CO_334.0000184',
+        "VIGOR",      'initial.vigor.assessment.1.7.CO_334.0000009',
+        "LCHROMO",    lchromo,
+        "ACHROMO",    achromo,
+        "BCHROMO",    bchromo) 
+
+
+#print traitnames
+#traitabbrevs %>% rmarkdown::paged_table()
+
+
+#save traitnames
+traitnames <- as.data.frame(traitabbrevs)$TraitAbbrev
+saveRDS(traitnames, file=paste0(project_path, "data/alltraitnames_", dataset, ".RDS"))
+
+```
+
+
+Clean & QC data
+```{r, warning=FALSE, message=FALSE}
+#define selection stage 
+rawtrialdata_staged <- rawtrialdata %>%
+
+  #Extract selection stage from trial name
+  mutate(selStage = case_when(grepl("pyt", studyName, ignore.case=T) ~ "PYT",
+                              grepl("ayt", studyName, ignore.case=T) ~ "AYT",
+                              grepl("uyt", studyName, ignore.case=T) ~ "UYT",
+                              grepl("NCRP", studyName, ignore.case=T) ~ "UYT", 
+                              #NCRP = nationally coordinated research program trial
+                              grepl("cet", studyName, ignore.case=T) ~ "CET",
+                              grepl("\\.CE\\.", studyName, ignore.case=T) ~ "CET",
+                              grepl("clonaleva", studyName, ignore.case=T) ~ "CET",
+                              grepl("22.GS.C6.STUDENT2.CE.500.IK", studyName, ignore.case=T) ~ "CET",
+                              grepl("22.GS.C7.CE.1360.IK", studyName, ignore.case=T) ~ "CET",
+                              grepl("geneticgain", studyName, ignore.case=T) ~ "GG",
+                              grepl("stock", studyName, ignore.case=T) ~ "MLT",
+                              grepl("Germ", studyName, ignore.case=T) ~ "MLT",
+                              grepl("conservation", studyName, ignore.case=T) ~ "MLT",
+                              T ~ "NA") %>% as.factor())
+
+
+# Run function `renameAndSelectCols()` to rename columns and remove everything unnecessary
+# QC Trait values
+trialdatall <- renameAndSelectCols(traitabbrevs, indata=rawtrialdata_staged, 
+                 customColsToKeep = c("TrialType","observationUnitName","selStage")) %>%
+  as.data.frame() %>% 
+  filter(!is.na(germplasmName)) %>% #remove trials without germplasm names
+  mutate(CMD1S=ifelse(CMD1S<1 | CMD1S>5,NA,CMD1S), #remove any nonsensical values for ordinal traits
+         CMD3S=ifelse(CMD3S<1 | CMD3S>5,NA,CMD3S),
+         CMD6S=ifelse(CMD6S<1 | CMD6S>5,NA,CMD6S), 
+         CMD9S=ifelse(CMD9S<1 | CMD9S>5,NA,CMD9S),
+         CGMS1=ifelse(CGMS1<1 | CGMS1>5,NA,CGMS1),
+         CGMS2=ifelse(CGMS2<1 | CGMS2>5,NA,CGMS2),
+         DM=ifelse(DM>100 | DM<=0,NA,DM),
+         DMSPGRAV=ifelse(DMSPGRAV>100 | DMSPGRAV<=0,NA,DMSPGRAV),
+         RTWT=ifelse(RTWT==0 | NOHAV==0 | is.na(NOHAV),NA,RTWT),
+         SHTWT=ifelse(SHTWT==0 | NOHAV==0 | is.na(NOHAV),NA,SHTWT),
+         RTNO=ifelse(RTNO==0 | NOHAV==0 | is.na(NOHAV),NA,RTNO),
+         NOHAV=ifelse(NOHAV==0,NA,NOHAV),
+         NOHAV=ifelse(NOHAV>42,NA,NOHAV),
+         RTNO=ifelse(!RTNO %in% 1:10000,NA,RTNO),
+         SPRTPERC=ifelse(SPRTPERC > 1 | SPRTPERC < 0, NA, SPRTPERC), 
+         CMD3I=ifelse(CMD3I > 1 | CMD3I < 0, NA, CMD3I), #proportion traits should be between 0 and 1
+         CAD6I=ifelse(CAD6I > 1 | CAD6I < 0, NA, CAD6I),
+         CBB3I=ifelse(CBB3I > 1 | CBB3I < 0, NA, CBB3I),
+         SPRTPERC=ifelse(SPRTPERC > 1 | SPRTPERC < 0, NA, SPRTPERC),
+         VIGOR=ifelse(VIGOR!=3 & VIGOR!=5 & VIGOR!=7, NA, VIGOR)) %>%
+  
+  #fix trials with block and plot number switched: 
+  mutate(blockNumber = case_when(studyName == "13uyt20mixedIB" |
+                                   studyName == "13uyt15yrt8AIB" |
+                                  studyName == "13pyt99highTCIB" |
+                                   studyName == "13uyt30whtrtIB" ~ as.character(plotNumber),
+                                 TRUE ~ as.character(blockNumber))) %>%
+  
+  #fix trial with plot number as replicate:
+  mutate( replicate = case_when(studyName == "13genpopIB" ~ as.character(blockNumber),
+                                TRUE ~ as.character(replicate))) %>%
+
+  #set proper class to variables
+  mutate_at(traitnames, as.numeric) %>%
+  mutate_at("studyName", as.factor) %>%
+  mutate_at("studyYear", as.factor) %>%
+  mutate_at("replicate", as.factor) %>%
+  mutate_at("blockNumber", as.factor) %>%
+  mutate_at("germplasmName", as.factor) %>%
+  mutate_at("locationName", as.factor) %>%
+  as.data.frame()
+
+#warning about NA generation when setting variables to numeric is okay
+
+
+saveRDS(trialdatall, file=paste0(project_path, "data/trialdatall_", dataset, ".RDS"))
+```
+
+Examine trait distributions and sample sizes of genotyped accessions, subset for the most relevant trials.
+```{r, warning=FALSE, message=FALSE}
+#filter for the list of genotyped accessions
+genotyped_accessions <- samplenames %>%
+  gsub("\\.", "-", .) %>% gsub("_A.*", "", .) #remove genotyping sample tag
+
+trialdat_genod <- trialdatall %>% filter(germplasmName %in% genotyped_accessions)
+
+
+#Trials with iCheck data:
+TC_trials <- unique(trialdat_genod %>%  filter(!is.na(.data[[TCtrait]])) %>% dplyr::select("studyName","selStage","germplasmName")) %>% 
+  group_by(studyName, selStage) %>%
+  summarise(ngenos_TC = n()) %>%
+  arrange(-ngenos_TC) 
+
+#Trials with DM data:
+DM_trials <- unique(trialdat_genod %>%  filter(!is.na(DM)) %>% dplyr::select("studyName","selStage","germplasmName")) %>% 
+  group_by(studyName, selStage) %>%
+  summarise(ngenos_DM = n()) %>%
+  arrange(-ngenos_DM) 
+
+#Filter trials for at least 3 TCICHK and 10 DM observations on genotyped accessions 
+TC_DM_trials <- left_join(TC_trials, DM_trials) %>%
+  filter(ngenos_TC > 3 | ngenos_DM > 10)
+
+print(paste0(nrow(TC_DM_trials), " trials with at least 3 TCICHK and 10 DM observations on genotyped accession"))
+
+trials_to_keep <- as.character(TC_DM_trials$studyName)
+```
+
+
+Filter based on non-zero per-trial heritability for carotenoids and dry matter if specified:
+Note: this only excludes the trials for which the model didn't fit (singularity issues).
+```{r}
+if( filter_trial_byH2 == TRUE){
+  #Set up storage vector
+  TrialH2storage <- data.frame(trials_to_keep, "TC"=NA, "DM"=NA)
+
+  for(i in seq_along(trials_to_keep)){
+
+    #Subset for one trial at a time
+    thistrial <- trials_to_keep[i]
+    print(i); #print(thistrial)
+    thistrialonly <- trialdatall %>% filter(studyName == thistrial) %>% droplevels()
+    
+    # print(sum(!is.na(thistrialonly$TCICHK)))
+    # print(sum(!is.na(thistrialonly$DM)))
+
+    #Check blocking structure
+    #print(table(thistrialonly$blockNumber))
+
+    for (j in 1:2){
+
+      traits <- c(TCtrait, "DM")
+      traiti <- traits[j]
+
+      fixedformula <- formula(paste0( traiti, "~ 1"))
+
+
+    trymodelfit <- tryCatch(
+      modeli <- asreml(data=thistrialonly,
+                       fixedformula,
+                       random = ~ germplasmName,
+                       trace=F),
+          error=function(e) e)
+
+      if(inherits(trymodelfit, "error")){ #if the model didn't fit, put in a placeholder
+
+         TrialH2storage[i, j+1] <- "NA"
+      }
+
+      if(!inherits(trymodelfit, "error") && trymodelfit$converge == TRUE){ #if the model successfully fit,
+
+        H2 <- vpredict(modeli, H2 ~ V1 / (V1+V2))
+        #print(as.numeric(H2[1]))
+
+        TrialH2storage[i, j+1] <- H2[1]
+      }
+    } #end trait
+  } #end trial
+
+
+  # Filter for trials with good H2
+
+  PassedTrials <- TrialH2storage %>% filter(TC >= 0.1 & DM >= 0.1)
+
+} else { #keep all trials if filter_trial_byH2 is FALSE
+
+  PassedTrials <- data.frame(trials_to_keep)
+}
+
+
+#filter down to only the more relevant trials
+trialdat_subset <- trialdatall %>% filter(studyName %in% PassedTrials$trials_to_keep) %>% droplevels()
+
+#print selected trial info
+print(paste0(length(PassedTrials$trials_to_keep), " trials kept"))
+
+trialinfo <- trialdat_subset %>% dplyr::select(studyName, locationName, studyYear, studyDesign, selStage) %>% 
+  unique() %>% 
+  left_join(TC_trials, by=c("studyName","selStage")) %>%
+  left_join(DM_trials, by=c("studyName","selStage")) %>%
+  rmarkdown::paged_table()
+
+#make sure all genotypes have phenotype data
+#missing accessions: IITA-TMS-IBA190198, IITA-TMS-IBA9100953
+print(paste0("missing phenotype data for: ", 
+             genotyped_accessions[!genotyped_accessions %in% trialdat_subset$germplasmName]))
+
+#count of trial type 
+table(trialinfo$selStage)
+
+#count number of observations of genotypes of interest across traits:
+trialinfo %>% dplyr::select(studyName, selStage, ngenos_TC, ngenos_DM)
+
+#selection stage info
+selstageinfo <- trialdat_subset %>% dplyr::select(germplasmName, studyYear, selStage) %>% 
+  unique() %>%
+  filter(germplasmName %in% genotyped_accessions) %>%
+  arrange(germplasmName) %>%
+  filter(selStage != "NA") %>%
+  pivot_longer(selStage, values_drop_na = TRUE) %>%
+  pivot_wider(id_cols="germplasmName", names_from=value, values_from=value, values_fn = length, values_fill = 0) %>%
+  arrange(UYT, AYT, PYT, CET) %>%
+  mutate(stage = case_when(UYT== 0 & AYT == 0 ~ "early", AYT > 2 | UYT > 0 ~ "advanced", T ~ "mid"))
+ 
+table(selstageinfo$stage)/sum(table(selstageinfo$stage)) * 100
+
+
+
+saveRDS(trialdat_subset, file=paste0(project_path, "data/trialdata_subset_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".RDS"))
+```
+
+
+
+Print table with trait names, abbreviations, and sample sizes
+```{r, warning=FALSE, message=FALSE}
+trialdat <- trialdat_subset
+
+## Count # of genotypes of interest with data for each trait
+traitcounts <- traitnames
+for(i in seq_along(traitnames)){
+    
+  traiti <- traitnames[i]
+  
+  ngenos_trait <- trialdat %>% filter( !is.na(get(traiti)) ) %>% 
+    filter(germplasmName %in% genotyped_accessions) %>%
+    dplyr::select(germplasmName) %>% unique() %>% nrow()
+  
+  traitcounts[i] <- ngenos_trait
+  
+  #cat(traiti, ngenos_trait, "\n")
+}
+
+TraitCounts <- data.frame(TraitAbbrev = traitnames, NGenotypes = as.numeric(traitcounts)) %>%
+  filter(NGenotypes > 300)
+
+
+TraitTable1 <- traitabbrevs
+TraitTable1$OntologyID <- str_extract(TraitTable1$TraitName, "CO_334.*")
+TraitTable1$TraitName <- gsub("CO_334.*" ,"", TraitTable1$TraitName) %>% gsub("\\."," ", .)
+
+TraitTable1 <- left_join(TraitCounts, TraitTable1, by="TraitAbbrev")
+
+#count accessions with both TC and DM data
+TCDMboth <- trialdat %>% filter( !is.na(TCICHK) & !is.na(DM) ) %>% 
+    filter(germplasmName %in% genotyped_accessions) %>%
+    dplyr::select(germplasmName) %>% unique() %>% nrow()
+#363 (but one gets filtered out later in outlier removal, final n = 362)
+
+TraitTable1 <- rbind(TraitTable1, c("TCICHK_DM", TCDMboth, "both TCICHK and DM", "NA"))
+
+  
+TraitTable1 %>% rmarkdown::paged_table()
+selectedtraits <- TraitTable1$TraitAbbrev[-nrow(TraitTable1)] #each of the major traits except the last TCICHK_DM combo
+saveRDS(selectedtraits, file=paste0("./data/selected_traitnames_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".RDS"))
+```
+
+
+```{r, warning=FALSE, message=FALSE, eval=F}
+#make a histogram for each of the major traits
+#n = sample size, # of observations
+
+for(i in seq_along(selectedtraits)){ 
+    
+  traiti <- TraitTable1$TraitAbbrev[i]
+  print(traiti)
+    
+  hist(trialdat[,traiti], main= paste0("n=", nsizes[traiti]), xlab=paste0(traiti))  
+}
+```
+
+Box-cox correction for normality: 
+(note: should I do outlier removal before Box-cox? 1/30/24: decided no, because normality is needed for the linear model that calculates residuals.)
+```{r, warning=FALSE, message=FALSE}
+trialdat_tfm <- trialdat
+  
+lambda_values <- data.frame(trait = selectedtraits, lambda=NA)
+for(i in seq_along(selectedtraits)){
+    
+  #for each trait
+    traiti <- selectedtraits[i]
+    print(traiti)
+    traitidata <- trialdat[,traiti]
+    traitidata[traitidata <= 0] <- NA #because boxcox requires strictly positive values 
+    
+  #box-cox transformation to find optimum lambda
+    bxcx <- boxcox( lm(traitidata ~ 1), plotit=F)
+    lambda <- bxcx$x[which.max(bxcx$y)]
+
+    # apply transformation and write over column
+    traiti_transformed <- ((traitidata ^ lambda) - 1) / lambda
+    trialdat_tfm[,traiti] <- scale(traiti_transformed) #scale data so traits are on the same scale
+    
+    #store lambda for downstream un-transformations
+    lambda_values[i,"lambda"] <- lambda
+}
+saveRDS(lambda_values, file=paste0(project_path, "output/Boxcox_lambda_values.RDS"))
+
+### Save checkpoint
+saveRDS(trialdat_tfm, file=paste0(project_path, "data/trialdata_tfm_scaled_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".RDS"))
+
+
+# check transformations
+plot(trialdat$TCICHK, trialdat_tfm$TCICHK, xlab="original", ylab="boxcox transformed", main="TCICHK")
+plot(trialdat$DM, trialdat_tfm$DM, xlab="original", ylab="boxcox transformed", main="DM")
+plot(trialdat$TCHART, trialdat_tfm$TCHART, xlab="original", ylab="boxcox transformed", main="TCHART")
+
+
+```
+
+
+Initial BLUP calculation for identifying and removing outliers based on studentized residuals using asreml
+```{r, warning=FALSE, message=FALSE}
+#set up blank dataframe to store results
+outlier.mat <- data.frame(1:nrow(trialdat_tfm)) 
+
+for(i in seq_along(selectedtraits)){ #go through each trait
+  traiti <- selectedtraits[i]; print(traiti)
+  
+  fixedformula <- formula(paste0( traiti, "~ 1 + locationName:studyYear"))
+  
+  trymodelfit <- tryCatch( #attempt to fit the model but don't stop the loop if there is an error
+    #interaction terms (outer:inner) are nested second within the first
+    modi <- asreml(data=trialdat_tfm, fixedformula,
+                 random = ~ germplasmName + 
+                   germplasmName:locationName:studyYear + studyName:blockNumber, 
+                 trace=F, aom=T), 
+    error=function(e) e)
+  
+  if(inherits(trymodelfit, "error") | trymodelfit$converge == FALSE){ #if the model didn't fit, put in a placeholder
+    blank <- rep(0, length(nrow(trialdat_tfm)))
+    outlier.mat <- cbind(outlier.mat, blank)
+  }
+  
+  if(!inherits(trymodelfit, "error") && trymodelfit$converge == TRUE){ #if the model successfully fit,
+    print(paste0(traiti, " model fit"))
+
+    # extract standardized residuals
+    stdRes <- resid(modi, type="stdCond")
+    resDF <- modi$nedf #residual degrees of freedom
+    studentizedRes <- stdRes / sqrt((resDF - stdRes ^ 2) / (resDF - 1))
+    
+    #set a threshold for outliers
+    N <- nrow(modi$mf)
+    threshold <- qt(p =  1 - 0.05 / (2 * N), df = (N - 2))
+    
+    # identify outliers 
+    significance <- rep("NA", length(stdRes))
+    significance[which(abs(stdRes) <= threshold)] <- 'pass'
+    significance[which(abs(stdRes) > threshold)] <- 'outlier_removed'
+    print(table(significance))
+          
+    outlier.mat <- cbind(outlier.mat, significance) #save vector of which points to exclude
+  }
+    colnames(outlier.mat)[1+i] <- traiti #save the trait name 
+}
+outlier.mat <- outlier.mat[,-1] #remove first placeholder column
+
+
+#remove outliers
+OutlierRMData <- as.matrix(trialdat_tfm %>% dplyr::select(all_of(selectedtraits)))
+#confirm that dimensions match
+dim(OutlierRMData) == dim(outlier.mat)
+#replace outlier values with NA
+OutlierRMData[outlier.mat == "outlier_removed"] <- NA 
+trialdat_cleaned <- cbind(trialdat_tfm[,c(1:20)], OutlierRMData)
+
+### Save checkpoint
+saveRDS(trialdat_cleaned, file=paste0(project_path, "data/trialdata_scaled_cleaned_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".RDS"))
+```
+
+
+
+Calculate BLUPs and H2 with asreml
+```{r, warning=FALSE, message=FALSE}
+# Re-read dataset if starting here
+#dataset <- "CASS" 
+trialdat_cleaned <- readRDS(file=paste0(project_path, "data/trialdata_scaled_cleaned_", dataset, "_TCICHK_", "H2filter", "FALSE", ".RDS"))
+selectedtraits <- readRDS(file=paste0("./data/selected_traitnames_", dataset, "_TCICHK_", "H2filter", "FALSE", ".RDS"))
+
+
+#initiate storage 
+model_storage <- list() 
+BLUP_storage <- data.frame(germplasmName = sort(unique(trialdat_cleaned$germplasmName))) 
+H2_storage <- data.frame()
+H2_cullis_storage <- data.frame() 
+
+
+for(i in seq_along(selectedtraits)){ #go through each trait
+  
+  traiti <- selectedtraits[i]; print(traiti)
+
+  fixedformula <- formula(paste0( traiti, "~ 1 + locationName:studyYear"))
+  
+  trymodelfit <- tryCatch(
+    #note: nested factors are outer:inner
+    modi <- asreml(data=trialdat_cleaned, trace=F,
+                   fixedformula,
+                   random = ~ germplasmName + 
+                     germplasmName:locationName:studyYear + studyName:blockNumber,
+                   na.action = na.method(y="omit")),
+    
+    error=function(e) e)
+  
+  if(!inherits(trymodelfit, "error") && trymodelfit$converge == TRUE){ #if the model converged:
+    print(paste0(traiti, " model fit"))
+    model_storage[[i]] <- modi #store full model
+  
+
+    #extract and de-regress BLUPs
+    randomeffs <- summary(modi, coef=TRUE)$coef.random
+    Vg <-  summary(modi)$varcomp["germplasmName", "component"]
+    
+    BLUPs_i <- randomeffs[grepl('germplasmName', rownames(randomeffs)) & !grepl('locationName', rownames(randomeffs)),] %>%
+      as.data.frame() %>% 
+      mutate(PEV=std.error^2, 
+             REL=1-(PEV/Vg),
+             drgBLUP=solution/REL) %>% #de-regress BLUPs
+      mutate(germplasmName = gsub("germplasmName_","",rownames(.)))
+    
+    BLUPs_tostore <- BLUPs_i %>% dplyr::select(germplasmName, drgBLUP) %>%
+      rename_with(~ paste0(traiti), drgBLUP)
+    
+    #store de-regressed BLUPs
+    BLUP_storage <- left_join(BLUP_storage, BLUPs_tostore, by="germplasmName") 
+    
+    #calculate heritability
+    nLocYearsperG <- trialdat_cleaned %>%
+      group_by(germplasmName) %>%
+      summarise(n_locyears = n_distinct(locationName:studyYear))
+    
+    harmonicMeanEnv <- 1 / mean(1 / nLocYearsperG$n_locyears)
+
+    nPlotsPerG <- trialdat_cleaned %>%
+      group_by(germplasmName) %>%
+      summarise(n_rep = n_distinct(locationName:studyYear:replicate))
+    
+    harmonicMeanPlots <- 1 / mean(1 / nPlotsPerG$n_rep)
+    
+    Vg <-  summary(modi)$varcomp["germplasmName", "component"]
+    Vgly <- summary(modi)$varcomp["germplasmName:locationName:studyYear", "component"]
+    Ve <- summary(modi)$varcomp["units!R", "component"]
+
+    H2 <- Vg / sum(Vg + (Vgly/harmonicMeanEnv) + (Ve/harmonicMeanPlots))
+    H2_storage <- rbind(H2_storage, H2) #store Heritability estimate
+     
+    
+    #calculate heritability with Cullis 2006 method
+    H2_cullis <- 1 - ((mean(BLUPs_i$PEV))/Vg)
+    H2_cullis_storage <- rbind(H2_cullis_storage, H2_cullis)
+    
+  } 
+  else{ #if there was a problem with the model, use NA as placeholders in storage vectors
+    print(paste0(traiti, " model failed to converge")) 
+    model_storage[[i]] <- NA
+     BLUP_storage <- cbind(BLUP_storage, rep(NA, length(unique(trialdat_cleaned$germplasmName))))
+     colnames(BLUP_storage)[1+i] <- traiti
+     H2_storage <- rbind(H2_storage, c(NA,NA))
+     H2_cullis_storage <- rbind(H2_cullis_storage, "NA")
+    }
+}
+names(model_storage) <- selectedtraits
+
+rownames(H2_storage) <- selectedtraits #reattach the trait names
+colnames(H2_storage) <- "H2, var. comp. method"
+
+rownames(H2_cullis_storage) <- selectedtraits #reattach the trait names
+colnames(H2_cullis_storage) <- "H2, Cullis 2006 method"
+
+
+### Save BLUPs
+# saveRDS(BLUP_storage, file=paste0(project_path, "data/alltrait_scaled_drgBLUPs_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".RDS"))
+# saveRDS(H2_storage, file=paste0(project_path, "data/alltrait_scaled_H2_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".RDS"))
+# saveRDS(H2_cullis_storage, file=paste0(project_path, "data/alltrait_scaled_H2_cullis_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2,".RDS"))
+# saveRDS(model_storage, file=paste0(project_path, "data/BLUPmodel_scaled_storage_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".RDS"))
+
+```
+
+
+
+Examine phenotypic data:
+```{r, warning=FALSE, message=FALSE}
+H2_storage<- readRDS(file=paste0(project_path, "data/alltrait_scaled_H2_CASS_TCICHK_H2filter", filter_trial_byH2, ".RDS"))
+BLUP_storage <- readRDS(file=paste0(project_path, "data/alltrait_scaled_drgBLUPs_CASS_TCICHK_H2filter", filter_trial_byH2, ".RDS"))
+model_storage <- readRDS(file=paste0(project_path, "data/BLUPmodel_scaled_storage_CASS_TCICHK_H2filter", filter_trial_byH2, ".RDS"))
+trialdat_cleaned <- readRDS(file=paste0(project_path, "data/trialdata_scaled_cleaned_CASS_TCICHK_H2filter", filter_trial_byH2, ".RDS"))
+genotyped_accessions <- read.table("./data/genotypenames_CASS.txt")[,1] %>%
+  gsub("\\.", "-", .) %>% gsub("_A.*", "", .)
+traitsofinterest <- c("TCICHK", "TCHART", "DM", "DYLD", "RTWT", "HI", "SPRTPERC", "FRYLD", "CMD3S", "CMD3I")
+
+
+#print heritability -- for table 1
+H2_storage %>% round(2) %>% rmarkdown::paged_table()
+
+#print number of observations
+for(i in 1:length(selectedtraits)){
+ cat(selectedtraits[i], 
+            nrow(trialdat_cleaned %>% filter(!is.na(.data[[selectedtraits[i]]])) ), "\n" )
+}
+
+
+#Calculate pairwise correlations between trait BLUPs
+BLUP_storage_genod <- BLUP_storage %>% filter(germplasmName %in% genotyped_accessions)
+cormat <- round(cor(BLUP_storage_genod[,-1], use="pairwise.complete.obs"), 3)
+cormat[upper.tri(cormat)] <- NA #remove upper triangle
+
+#get p-values for correlations
+cor.test.p <- function(x){
+    FUN <- function(x, y) cor.test(x, y)[["p.value"]]
+    z <- outer(
+      colnames(x), 
+      colnames(x), 
+      Vectorize(function(i,j) FUN(x[,i], x[,j]))
+    )
+    dimnames(z) <- list(colnames(x), colnames(x))
+    z
+}
+cormat_pvals <- cor.test.p(BLUP_storage_genod[,-1])
+cormat_pvals[upper.tri(cormat_pvals)] <- NA #remove upper triangle
+
+melted_pvals <- reshape2::melt(cormat_pvals) %>% filter(!is.na(value)) %>%
+  mutate(pvalue = signif(value, 3)) %>% dplyr::select(-value) %>%
+  filter(Var1 %in% traitsofinterest & Var2 %in% traitsofinterest)
+
+traitsofinterest <- c("TCICHK", "TCHART", "DM", "DYLD", "RTWT", "HI", "SPRTPERC", "FRYLD", "CMD3S", "CMD3I")
+
+melted_cormat <- reshape2::melt(cormat) %>% filter(!is.na(value)) %>%
+  mutate(Rlabel = round(value, 2)) %>% 
+  filter(Var1 %in% traitsofinterest & Var2 %in% traitsofinterest) %>%
+  left_join(melted_pvals) %>%
+  mutate(sig = as.factor(case_when(Var1 == Var2 ~ "plain",
+                                   pvalue < 0.05 ~ "bold", 
+                                   T ~ "plain")))
+
+#heatmap of trait correlation matrix
+ggplot(data = melted_cormat, aes(x=Var1, y=Var2, fill=value)) +
+  geom_tile() +
+  #geom_tile(aes(color = sig, width=0.95, height=0.95), size=0.8) +
+  #scale_color_manual(values=c("white","black"), guide="none") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\ncorrelation\ncoefficient (r)") +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+     hjust = 1))+
+  coord_fixed() +
+  xlab("") +
+  ylab("") +
+  geom_text(aes(label=Rlabel, fontface=sig), size=3, parse=F) +
+  ggtitle(paste0("Genetic correlations between traits")) +
+  theme(panel.grid = element_blank())
+
+ggsave(file=paste0(project_path, "figures/TraitScaledCorrMatrix_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".jpg"), bg="white")
+
+
+#Phenotypic correlation between TC and DM
+phenocor <- cor.test(trialdat_cleaned$TCICHK, trialdat_cleaned$DM, na.rm=T)
+phenocor
+phenocor$p.value
+#plot(trialdat_cleaned$TCICHK, trialdat_cleaned$DM)
+#cor.test(trialdat_cleaned$TCHART, trialdat_cleaned$DM, na.rm=T)
+
+#Genetic correlation between TC and DM in full dataset
+genocor <- cor.test(BLUP_storage$TCICHK, BLUP_storage$DM, na.rm=T)
+genocor
+genocor$p.value
+# there is a stronger negative genetic correlation than there is phenotypic
+
+#Genetic correlation between TC and DM in genotyped subset
+TCICHK_DM_cor <- cor.test(BLUP_storage_genod$TCICHK, BLUP_storage_genod$DM, na.rm=T)
+TCICHK_DM_cor
+TCICHK_DM_cor$p.value
+
+
+ggplot(data=BLUP_storage_genod, aes(TCICHK, DM)) +
+  geom_point() +
+  ggtitle("Genetic correlation between TCICHK and DM") +
+  geom_smooth(method='lm', formula= y~x, se=F, lty=2, size=0.5) +
+  annotate("text", x=1.25 , y= 1.75, label= paste0("r = ", round(TCICHK_DM_cor$estimate,2))) +
+  annotate("text", x=1.25 , y= 1.5, label=paste0("p = ", signif(TCICHK_DM_cor$p.value, digits=3))) +
+  xlab("TCICHK BLUP") +
+  ylab("DM BLUP")
+
+#ggsave("~/Desktop/images_dwnld/TCDMcorplot.png", bg="white", width=6, height=5)
+
+ggsave(file=paste0(project_path, "figures/TCDM_scaled_cor_plot_all", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".jpg"))
+
+
+
+#Genetic correlation between TC and DM in yellow-only dataset
+ggplot(data=BLUP_storage %>% filter(TCICHK>-1.25), aes(TCICHK, DM)) +
+  geom_point() +
+  ggtitle("Genetic correlation between TC and DM BLUPs only in 'yellow' clones") +
+  geom_smooth(method='lm', formula= y~x, se=F, lty=2, size=0.5)
+ggsave(file=paste0(project_path, "figures/TCDM_scaled_cor_plot_ylw", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".jpg"))
+
+
+
+#Calculate pairwise correlations between residuals
+TCICHK_resids <- model_storage[[1]]$residuals
+DM_resids <- model_storage[[3]]$residuals
+
+cor.test(TCICHK_resids, DM_resids)
+#residuals are also (very) slightly negatively correlated
+
+ggplot(data=as.data.frame(TCICHK_resids, DM_resids), 
+       aes(TCICHK_resids, DM_resids)) +
+  geom_point() +
+  ggtitle("Correlation between TC and DM residuals") +
+  geom_smooth(method='lm', formula= y~x, se=F, lty=2, size=0.5)
+
+#Check that the residuals are normally distributed -- looks good
+hist(TCICHK_resids, main="TC residuals", xlab="residuals")
+hist(DM_resids, main="DM residuals", xlab="residuals")
+```
+
+
+
+
+
+How many white vs yellow accessions are there?
+```{r}
+dataset <- "CASS"
+filter_trial_byH2 <- TRUE
+TCtrait <- "TCICHK"
+
+
+trialdat_cleaned <- readRDS(file=paste0(project_path, "data/trialdata_cleaned_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".RDS"))
+
+trialdat_subset <- readRDS(file=paste0(project_path, "data/trialdata_subset_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2, ".RDS"))
+
+BLUPs <- read.table(file=paste0(project_path, "data/BLUPmatrix_named_", dataset, ".txt"), header=T) %>%
+  mutate(germplasmName = as.factor(sample_names))
+
+trialdat_subset_colorsum <- trialdat_subset %>% filter(germplasmName %in% BLUPs$sample_names) %>%
+  group_by(germplasmName) %>%
+  summarise(meanTCHART = mean(TCHART, na.rm=T), meanTCICHK = mean(TCICHK, na.rm=T)) %>%
+  mutate(category = case_when(meanTCICHK >=4 ~ "yellow", 
+                              meanTCHART > 1.5 & is.na(meanTCICHK) ~ "yellow",
+                              is.na(meanTCHART) & meanTCICHK >=4 ~ "yellow", 
+                              meanTCHART > 1.5 | meanTCICHK < 4 ~ "white", T~"NA"))
+
+# save names of yellow accessions
+yellow_only <- trialdat_subset_colorsum %>% filter(category == "yellow")
+saveRDS(yellow_only, file=paste0(project_path, "yellowSubpop/yellowNamesSummary.RDS"))
+
+ggplot(trialdat_subset_colorsum, aes(meanTCHART, meanTCICHK)) +
+  geom_point(aes(fill=meanTCICHK), pch=21, color="dark gray", size=2) +
+  scale_fill_gradient2(low="white", mid="#ffec5c", high="dark orange", midpoint=15)
+
+#saveRDS(trialdat_subset_colorsum, file=paste0(project_path, "data/genotyped_accessions_color_categorization_CASS.RDS"))
+```
+
+
+

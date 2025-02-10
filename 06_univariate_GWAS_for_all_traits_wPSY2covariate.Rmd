@@ -1,0 +1,893 @@
+---
+title: "07_GWAS_for_other_traits"
+output: html_document
+date: "2024-03-20"
+---
+
+
+# About
+Run univariate trait associations using mixed linear models in asreml.
+
+# Setup
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse); library(qqman); library(asreml); library(parallel) 
+project_path <- "/workdir/ssv42/mvGWAS/"
+setwd(project_path)
+set.seed(14850)
+
+dataset <- "CASS"
+```
+
+
+
+###############
+Copy and paste the code below into the terminal version of R in a screen session (so that Rstudio remains free):
+
+# Run univariate associations with TCICHK and DM with PSY2 SNP as fixed effect:
+
+```{r, eval=F}
+setwd("/workdir/ssv42/mvGWAS/")
+library(parallel)
+project_path <- "/workdir/ssv42/mvGWAS/"
+dataset <- "CASS"
+ncores <- 80
+
+
+SNP_uniGWAS_function <- function(section, GWAStrait){
+  
+  library(tidyverse); library(asreml); library(aod)
+  project_path <- "/workdir/ssv42/mvGWAS/"
+  dataset <- "CASS"
+  
+  #read in genotype data
+  genomat_KASP <<- readRDS(file=paste0(project_path, "data/genomat_plusKASP_filtered.RDS"))
+  genomat_ROG <<- genomat_KASP %>% filter(SNP != "S1_24155522")
+  #genomat_ROG <<- readRDS(file=paste0(project_path, "data/genomat_restofgenome_", dataset, ".RDS"))
+  Ginv_ROG <<- readRDS(file=paste0(project_path, "data/Ginverse_ROG_sparse_CASS.RDS"))
+
+  #read in phenotype data
+  BLUPs_data <<- readRDS(file=paste0(project_path, "data/BLUPs_scaled_and_hap_data_", dataset, ".RDS"))
+  
+  #get PSY2 KASP marker covariate
+  PSY2marker <- as.data.frame(t(genomat_KASP[genomat_KASP$SNP == "S1_24155522",] %>% dplyr::select(-c("SNP","ALT","REF","compute_group"))))
+  colnames(PSY2marker) <- "S1_24155522"
+  PSY2marker$germplasmName <- rownames(PSY2marker)
+  PSY2marker$S1_24155522_dom <- ifelse(PSY2marker$S1_24155522 == 1, 1, 0)
+  
+  #read in PC covariates
+  PCaccessionnames <- read.table(file= paste0(project_path, "data/", dataset, "_accessionnames.txt"))[,1]
+  dosagesPCA <- readRDS(file=paste0(project_path, "data/DosageMatrix_PCA_", dataset, ".RDS"))
+  dosagesPC_sum <- summary(dosagesPCA) 
+  dosagesPC <- as.data.frame(dosagesPCA$x)[,1:5]; dosagesPC$germplasmName <- PCaccessionnames
+  
+  #Merge data together
+  BLUPs_covs_data <- left_join(BLUPs_data, PSY2marker, by="germplasmName") %>%
+    left_join(dosagesPC, by="germplasmName")
+  
+  
+  # Loop across all "rest of genome" SNPs 
+  #storage for SNP effects
+  SNPeff_storage <- list()
+  SNPeff_storage_PCs <- list()
+  #storage for Wald test of fixed effect significance
+  WaldTest_storage <- list()
+  WaldTest_storage_PCs <- list()
+  #storage for model objects
+  model_storage <- list()
+  model_storage_PCs <- list()
+
+  #select SNPs in this compute group
+  section_SNPs <<- genomat_ROG %>% filter(compute_group == section)
+  
+  #initiate storage for SNP effects
+  all_SNP_results_df <- as.data.frame(matrix(nrow = nrow(section_SNPs), ncol = 8))
+  colnames(all_SNP_results_df) <- c("Beta_SNP", "Beta_SNP_SE", "Zratio", "SNP_ID", "Df", "Sum_Sq", "Wald_stat", "Pr")
+  
+  #check last SNP run in this section
+  lastrun <- read.table(paste0(project_path, "output/univariate_models/progressbar/DM_PSY2KASPand5PCs_run_1210.txt"))
+  resume_run <- lastrun %>% filter(V7 == section) %>% dplyr::select(V2) %>% tail(n=1)
+
+  #for(i in seq_along(section_SNPs$SNP)){
+  for(i in c(as.numeric(resume_run):length(section_SNPs$SNP))){
+    #debug note: chr 1 peak is at: i = 292; section = 1
+    SNPi <- section_SNPs$SNP[i]
+    SNPidata <- as.data.frame(t(section_SNPs[i, -c(1:3)]))
+    colnames(SNPidata) <- paste0(SNPi)
+    SNPidata$germplasmName <- gsub("\\.","-", rownames(SNPidata))
+
+    modeldata <- left_join(BLUPs_covs_data, SNPidata, by="germplasmName") %>% 
+      mutate(germplasmName = as.factor(germplasmName))
+    modeldata <<- modeldata
+    
+    
+    #fit model with PCs:
+
+    if(GWAStrait %in% c("TCICHK","TCHART","DM")){
+      fixedformula <- formula(paste0(GWAStrait, " ~ 1 + ", SNPi, " + S1_24155522 + S1_24155522_dom + PC1 + PC2 + PC3 + PC4 + PC5"))
+    } else {
+      fixedformula <- formula(paste0(GWAStrait, " ~ 1 + ", SNPi, " + PC1 + PC2 + PC3 + PC4 + PC5"))
+    }
+    
+    #univariate model with PCs
+    SNPimodelwPCs <- asreml(data = modeldata,
+       fixed = fixedformula,
+         random = ~ vm(germplasmName, Ginv_ROG),
+        residual = ~units)
+    
+    SNPeff_wPCs <- summary(SNPimodelwPCs, coef=T)$coef.fixed[paste0(SNPi),]
+    SNPeff_wPCs[paste0(SNPi)] <- NA
+    
+    #save model with PCs
+    SNPimodelwPCs <<- SNPimodelwPCs
+    model_storage_PCs[[i]] <- SNPimodelwPCs
+    model_storage_PCs <<- model_storage_PCs
+    
+    #Wald test for significance of fixed effects
+    #WaldTest <- wald.asreml(SNPimodelnoPCs)
+    WaldTest_wPCs <- wald.asreml(SNPimodelwPCs)
+ 
+    
+   
+  # #fit model without PCs:
+  #   
+  #   if(GWAStrait %in% c("TCICHK","TCHART","DM")){
+  #     fixedformula <- formula(paste0(GWAStrait, " ~ 1 + ", SNPi, " + S1_24155522"))
+  #   } else {
+  #     fixedformula <- formula(paste0(GWAStrait, " ~ 1 + ", SNPi))
+  #   }
+  #   
+  #   #univariate model without PCs
+  #   SNPimodelnoPCs <- asreml(data = modeldata,
+  #      fixed = fixedformula,
+  #        random = ~ vm(germplasmName, Ginv_ROG),
+  #       residual = ~units)
+  #   
+  #   SNPeff <- summary(SNPimodelnoPCs, coef=T)$coef.fixed[paste0(SNPi),]
+  #   SNPeff[paste0(SNPi)] <- NA
+  #   
+  #   #save model without PCs
+  #   SNPimodelnoPCs <<- SNPimodelnoPCs
+  #   model_storage[[i]] <- SNPimodelnoPCs
+  #   model_storage <<- model_storage
+  
+  
+   
+    #Store SNP effect estimates and Wald tests
+    # WaldTest_storage[[i]] <- WaldTest[paste0(SNPi),]
+    # WaldTest_storage <<- WaldTest_storage
+    # WaldTest_storage_PCs[[i]] <- WaldTest_wPCs[paste0(SNPi),]
+    # WaldTest_storage_PCs <<- WaldTest_storage_PCs
+    # # SNPeff_storage[[i]] <- SNPeff
+    # # SNPeff_storage <<- SNPeff_storage
+    # SNPeff_storage_PCs[[i]] <- SNPeff_wPCs
+    # SNPeff_storage_PCs <<- SNPeff_storage_PCs
+    
+  #   
+  # saveRDS(SNPeff_storage, file=paste0(project_path,
+  #                 "output/univariate_models/", GWAStrait, "_SNPeffects_noPCs_section",
+  #                 section, "_", dataset, "_",
+  #             format(Sys.time(), "%m%d"), ".RDS"))
+  # saveRDS(SNPeff_storage_PCs, file=paste0(project_path,
+  #                 "output/univariate_models/", GWAStrait, "_SNPeffects_wPCs_section",
+  #                 section, "_", dataset, "_",
+  #             format(Sys.time(), "%m%d"), ".RDS"))
+  # saveRDS(WaldTest_storage, file=paste0(project_path,
+  #                 "output/univariate_models/", GWAStrait, "_SNPWaldTest_noPCs_section",
+  #                 section, "_", dataset, "_",
+  #             format(Sys.time(), "%m%d"), ".RDS"))
+  # saveRDS(WaldTest_storage_PCs, file=paste0(project_path,
+  #                 "output/univariate_models/", GWAStrait, "_SNPWaldTest_wPCs_section",
+  #                 section, "_", dataset, "_",
+  #             format(Sys.time(), "%m%d"), ".RDS"))
+  # saveRDS(model_storage, file=paste0(project_path,
+  #                 "output/univariate_models/", GWAStrait, "_modelstorage_noPCs_section",
+  #                 section, "_", dataset, "_",
+  #             format(Sys.time(), "%m%d"), ".RDS"))
+    
+    
+    #bind together and save results to dataframe
+    SNP_results_i <- cbind(t(SNPeff_wPCs), t(WaldTest_wPCs[paste0(SNPi),]))
+    SNP_results_i[1,4] <- colnames(SNP_results_i)[4] # add SNP_ID
+    
+    all_SNP_results_df[i,] <- SNP_results_i
+    rownames(all_SNP_results_df)[i] <- colnames(SNP_results_i)[4] #SNP_ID
+    
+    saveRDS(all_SNP_results_df, file=paste0(project_path,
+                  "output/univariate_models/", GWAStrait, "_all_SNP_results_wPCs_section",
+                  section, "_", format(Sys.time(), "%m%d"), ".RDS"))
+    
+    #save model object
+    saveRDS(model_storage_PCs, file=paste0(project_path,
+                  "output/univariate_models/", GWAStrait, "_modelstorage_wPCs_section",
+                  section, "_", dataset, "_",
+              format(Sys.time(), "%m%d"), ".RDS"))
+    
+    cat(paste0(SNPi, ", ", i, " of ", length(section_SNPs$SNP), " in section ", section, "\n"),
+      file = paste0(project_path, "output/univariate_models/progressbar/", GWAStrait, "_PSY2KASPand5PCs_run_", format(Sys.time(), "%m%d"), ".txt"), append=T)
+
+  } #end SNP
+
+} #end compute section
+
+
+
+
+#Run asreml GWAS function over multiple cores:
+sections <- 1:ncores
+  
+# create cluster object
+cl <- makeCluster(ncores)
+# test each SNP spread over the cores
+# results1 <- parSapply(cl, sections, GWAStrait = "TCICHK", SNP_uniGWAS_function)
+# results2 <- parSapply(cl, sections, GWAStrait = "TCHART", SNP_uniGWAS_function)
+ results3 <- parSapply(cl, sections, GWAStrait = "DM", SNP_uniGWAS_function)
+# results4 <- parSapply(cl, sections, GWAStrait = "DYLD", SNP_GWAS_function)
+
+# results5 <- parSapply(cl, sections, GWAStrait = "RTWT", SNP_uniGWAS_function)
+# results6 <- parSapply(cl, sections, GWAStrait = "HI", SNP_uniGWAS_function)
+# results7 <- parSapply(cl, sections, GWAStrait = "SPRTPERC", SNP_uniGWAS_function)
+# results8 <- parSapply(cl, sections, GWAStrait = "FRYLD", SNP_uniGWAS_function)
+# results9 <- parSapply(cl, sections, GWAStrait = "CMD3S", SNP_uniGWAS_function)
+# results10 <- parSapply(cl, sections, GWAStrait = "CMD3I", SNP_uniGWAS_function)
+
+
+# close cluster object
+stopCluster(cl)
+```
+
+Combine results from parallel computation sections for TCICHK, DM, and TCHART run with PSY2 covariate:
+Traits' run dates:
+TCICHK = 07/16; 12/09
+TCHART = 12/10
+DM = 12/10; 12/11
+```{r}
+library(tidyverse)
+project_path <- "/workdir/ssv42/mvGWAS/"
+dataset <- "CASS"
+ncores <- 80
+lastrundate <- "1210" # may need a tryCatch if sections finished on different dates
+GWAStrait <- "DM"
+PCstatus <- "wPCs" #noPCs or wPCs
+
+all_SNP_results_df <- data.frame()
+for (i in 1:ncores){
+  section <- i
+  print(i)
+  
+  lookupresults <- tryCatch(
+    SNPresults_i <- readRDS(file=paste0(project_path,
+               "output/univariate_models/", GWAStrait, "_all_SNP_results_", PCstatus, "_section", section, "_", lastrundate, ".RDS")),
+    error = function(e) e)
+
+  if(inherits(lookupresults, "error") ){
+    print("trying previous day")
+    lastrundate <- "1209"
+     SNPresults_i <- readRDS(file=paste0(project_path,
+               "output/univariate_models/", GWAStrait, "_all_SNP_results_", PCstatus, "_section", section, "_", lastrundate, ".RDS"))
+  }
+
+  all_SNP_results_df <- rbind(all_SNP_results_df, SNPresults_i)
+}
+
+# extract SNP information
+all_SNP_results_df$SNP_ID <- rownames(all_SNP_results_df)
+all_SNP_results_df$CHROM <- gsub("_[0-9].*", "",  rownames(all_SNP_results_df)) %>% gsub("S","",.)
+all_SNP_results_df$POS <- gsub("S[0-9]*_", "",  rownames(all_SNP_results_df))
+
+
+saveRDS(all_SNP_results_df, file=paste0(project_path,
+             "output/univariate_models/", GWAStrait, "_all_SNP_results_df_", 
+             format(Sys.time(), "%m%d"), ".RDS"))
+```
+
+
+
+Run dates:
+RTWT = 0909 / 0910
+HI = 0910
+SPRTPERC = 
+FRYLD = 
+CMD3S = 
+CMD3I = 
+
+
+Combine results from the parallel computation sections:
+```{r}
+library(tidyverse)
+project_path <- "/workdir/ssv42/mvGWAS/"
+dataset <- "CASS"
+ncores <- 80
+lastrundate <- "0910" # may need a tryCatch if sections finished on different dates
+GWAStrait <- "HI"
+PCstatus <- "wPCs" #noPCs or wPCs
+
+all_SNP_results_df <- data.frame()
+for (i in 1:ncores){
+  section <- i
+  print(i)
+  
+  lookupresults <- tryCatch(
+    SNPresults_i <- readRDS(file=paste0(project_path,
+               "output/univariate_models/", GWAStrait, "_all_SNP_results_", PCstatus, "_section", section, "_", lastrundate, ".RDS")),
+    error = function(e) e)
+
+  if(inherits(lookupresults, "error") ){
+    print("trying previous day")
+    lastrundate <- "0909"
+     SNPresults_i <- readRDS(file=paste0(project_path,
+               "output/univariate_models/", GWAStrait, "_all_SNP_results_", PCstatus, "_section", section, "_", lastrundate, ".RDS"))
+  }
+
+  all_SNP_results_df <- rbind(all_SNP_results_df, SNPresults_i)
+}
+
+# extract SNP information
+all_SNP_results_df$SNP_ID <- rownames(all_SNP_results_df)
+all_SNP_results_df$CHROM <- gsub("_[0-9].*", "",  rownames(all_SNP_results_df)) %>% gsub("S","",.)
+all_SNP_results_df$POS <- gsub("S[0-9]*_", "",  rownames(all_SNP_results_df))
+
+
+saveRDS(all_SNP_results_df, file=paste0(project_path,
+             "output/univariate_models/", GWAStrait, "_all_SNP_results_df_", 
+             format(Sys.time(), "%m%d"), ".RDS"))
+```
+
+
+Copy results back from remote computer (cbsulm13 on 9/10):
+scp ./output/univariate_models/*_all_SNP_results_df_*.RDS ssv42@cbsurobbins.biohpc.cornell.edu:/workdir/ssv42/mvGWAS/output/univariate_models/
+
+
+
+OLD code below:
+
+Traits' run dates:
+
+DYLD = 0611 / 0610 -- done on cbsurobbins
+RTWT = 0710 / 0709 -- done on cbsulm31
+HI = 0710 / 0709 -- done on cbsulm31
+SPRTPERC = 0711 / 0710 -- done on cbsulm31
+FRYLD = 0712 / 0711 -- done on cbsulm31
+CMD3S = 0712 / 0712 -- done on cbsulm31
+CMD3I = 0713 / 0712 -- done on cbsulm31
+
+Combine results from the parallel computation sections:
+```{r}
+library(tidyverse)
+project_path <- "/workdir/ssv42/mvGWAS/"
+dataset <- "CASS"
+ncores <- 80
+lastrundate <- "0716" # may need a tryCatch if sections finished on different dates
+GWAStrait <- "TCICHK"
+PCstatus <- "wPCs" #noPCs or wPCs
+
+#combine all SNP effects
+all_SNP_results <- list()
+all_Wald_results <- list()
+for (i in 1:ncores){ #append each section together into one list
+  section <- i
+  #print(i)
+  
+  
+  lookupresults <- tryCatch(
+    SNPeffs_i <- readRDS(file=paste0(project_path,
+               "output/univariate_models/", GWAStrait, "_SNPeffects_", PCstatus,"_section", 
+               section, "_", dataset, "_", lastrundate, ".RDS")),
+    
+     Waldtests_i <- readRDS(file=paste0(project_path,
+               "output/univariate_models/", GWAStrait, "_SNPWaldTest_", PCstatus, "_section", 
+               section, "_", dataset, "_", lastrundate, ".RDS")),
+  error = function(e) e)
+  
+  if(inherits(lookupresults, "error") ){
+    print("trying day before")
+    lastrundate <- "0712"
+     SNPeffs_i <- readRDS(file=paste0(project_path,
+               "output/univariate_models/", GWAStrait, "_SNPeffects_", PCstatus,"_section", 
+               section, "_", dataset, "_", lastrundate, ".RDS"))
+    
+     Waldtests_i <- readRDS(file=paste0(project_path,
+               "output/univariate_models/", GWAStrait, "_SNPWaldTest_", PCstatus, "_section", 
+               section, "_", dataset, "_", lastrundate, ".RDS"))
+  }
+
+  all_SNP_results <- append(all_SNP_results, SNPeffs_i)
+  all_Wald_results <- append(all_Wald_results, Waldtests_i)
+  
+}
+saveRDS(all_SNP_results, file=paste0(project_path,
+             "output/univariate_models/", GWAStrait, "_allSNPeffects_", PCstatus, "_", dataset, "_",
+             format(Sys.time(), "%m%d"), ".RDS"))
+saveRDS(all_Wald_results, file=paste0(project_path,
+             "output/univariate_models/", GWAStrait, "_allSNPWaldTests_", PCstatus, "_", dataset, "_",
+             format(Sys.time(), "%m%d"), ".RDS"))
+
+
+#Transform data so SNPs are in rows and Beta estimates and pvalues are in columns -- for asreml wald test version
+all_SNP_results_df <- as.data.frame(matrix(nrow = length(all_SNP_results), ncol = 8))
+colnames(all_SNP_results_df) <- c("Beta_SNP", "Beta_SNP_SE", "Zratio", "SNP_ID", "Df", "Sum_Sq", "Wald_stat", "Pr")
+
+for (i in 1:length(all_SNP_results)){
+
+  Betas_i <- all_SNP_results[[i]]
+  Wald_i <- all_Wald_results[[i]]
+  
+  SNP_i_results <- cbind(t(Betas_i), t(Wald_i))
+  SNP_i_results[1,4] <- colnames(SNP_i_results)[4] #SNP_ID
+
+  all_SNP_results_df[i,] <- SNP_i_results
+
+  rownames(all_SNP_results_df)[i] <- colnames(SNP_i_results)[4] #SNP_ID
+}
+
+
+
+# extract SNP information
+all_SNP_results_df$CHROM <- gsub("_[0-9].*", "",  rownames(all_SNP_results_df)) %>% gsub("S","",.)
+all_SNP_results_df$POS <- as.numeric(gsub("S[0-9]*_", "",  rownames(all_SNP_results_df)))
+all_SNP_results_df$Pr <- as.numeric(all_SNP_results_df$Pr)
+
+
+saveRDS(all_SNP_results_df, file=paste0(project_path,
+             "output/univariate_models/", GWAStrait, "_allSNPeffects_df", PCstatus, "_", dataset, "_",
+             format(Sys.time(), "%m%d"), ".RDS"))
+```
+
+Copy results back from remote computer:
+scp ./output/univariate_models/*_all*.RDS ssv42@cbsurobbins.biohpc.cornell.edu:/workdir/ssv42/mvGWAS/output/univariate_models/
+
+
+
+## Examine the results
+Read in results and make Q-Q plots
+```{r}
+TCICHK_PSY2PCs_SNP_results_df <- readRDS(file=paste0(project_path,
+             "output/univariate_models/TCICHK_all_SNP_results_df_1211.RDS"))
+
+DM_PSY2PCs_SNP_results_df <- readRDS(file=paste0(project_path,
+             "output/univariate_models/DM_all_SNP_results_df_1211.RDS"))
+
+TCHART_PSY2PCs_SNP_results_df <- readRDS(file=paste0(project_path,
+             "output/univariate_models/TCHART_all_SNP_results_df_1211.RDS"))
+
+
+png(paste0(project_path, "figures/TCICHK_QQplot_wPSY2KASPand5PCs_", dataset, "_",
+                    format(Sys.time(), "%m%d"), ".png"), 
+        width=6, height=6, res=250, units="in")
+qqman::qq(as.numeric(TCICHK_PSY2PCs_SNP_results_df$Pr), main="TCICHK with PSY2 KASP covariate and PCs")
+dev.off()
+
+png(paste0(project_path, "figures/DM_QQplot_wPSY2KASPand5PCs_", dataset, "_",
+                    format(Sys.time(), "%m%d"), ".png"), 
+        width=6, height=6, res=250, units="in")
+qqman::qq(as.numeric(DM_PSY2PCs_SNP_results_df$Pr), main="DM with PSY2 KASP covariate")
+dev.off()
+
+png(paste0(project_path, "figures/TCHART_QQplot_wPSY2KASPand5PCs_", dataset, "_",
+                    format(Sys.time(), "%m%d"), ".png"), 
+        width=6, height=6, res=250, units="in")
+qqman::qq(as.numeric(TCHART_PSY2PCs_SNP_results_df$Pr), main="TCHART with PSY2 KASP covariate")
+dev.off()
+```
+Make Manhattan plots:
+
+1) TCICHK with PSY2 KASP covariate and 5 PCs 
+```{r}
+# Set significance cut-off
+alpha <- 0.05
+#Gao modified Bonferroni
+Meff_chrom <- readRDS(file="./output/Meff_perchrom_estimates_CASS.RDS")
+Meff <- sum(Meff_chrom)
+Gao.cutoff <- alpha/Meff
+
+TCICHK_PSY2PCs_SNP_results_df$POS <- as.numeric(TCICHK_PSY2PCs_SNP_results_df$POS)
+TCICHK_PSY2PCs_SNP_results_df$Pr <- as.numeric(TCICHK_PSY2PCs_SNP_results_df$Pr)
+TCICHK_results <- TCICHK_PSY2PCs_SNP_results_df %>% arrange(as.numeric(CHROM), as.numeric(POS))
+
+#order factor levels so they display in order of chromosome
+TCICHK_results$SNP_ID <- factor(TCICHK_results$SNP_ID, levels = TCICHK_results$SNP_ID)
+TCICHK_results$CHROM <- as.factor(TCICHK_results$CHROM)
+TCICHK_results$CHROM <- factor(TCICHK_results$CHROM, levels = as.character(c(1:18)))
+
+
+#set color scheme
+colPalette <- rep(c("blue4","pink3"),9)
+
+## Plot Manhattan with bivariate Wald test p-values
+ggplot(TCICHK_results, aes(x=POS, y=-log10(Pr))) +
+  geom_point(aes(color=CHROM), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("Univariate GWAS for TCICHK with PSY2 covariate and 5 PCs")) +
+  guides(color="none")+
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(TCICHK_results, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #causal SNP position
+#PSY2 v6 is 24153419 - 24156720
+#with cushion of 20kb on either side: PSY2region = 24133419 - 24176720
+
+ggsave(filename=paste0(project_path, "figures/TCICHK_GWAS_wPSY2KASPand5PCs_", 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+```
+
+
+2) DM with PSY2 KASP and 5 PCs
+```{r}
+DM_PSY2PCs_SNP_results_df$POS <- as.numeric(DM_PSY2PCs_SNP_results_df$POS)
+DM_PSY2PCs_SNP_results_df$Pr <- as.numeric(DM_PSY2PCs_SNP_results_df$Pr)
+DM_results <- DM_PSY2PCs_SNP_results_df %>% arrange(as.numeric(CHROM), as.numeric(POS))
+
+#order factor levels so they display in order of chromosome
+DM_results$SNP_ID <- factor(DM_results$SNP_ID, levels = DM_results$SNP_ID)
+DM_results$CHROM <- as.factor(DM_results$CHROM)
+DM_results$CHROM <- factor(DM_results$CHROM, levels = as.character(c(1:18)))
+
+
+#set color scheme
+colPalette <- rep(c("blue4","pink3"),9)
+
+## Plot Manhattan with bivariate Wald test p-values
+ggplot(DM_results, aes(x=POS, y=-log10(Pr))) +
+  geom_point(aes(color=CHROM), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("Univariate GWAS for DM with PSY2 KASP and 5 PCs")) +
+  guides(color="none")+
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(DM_results, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #causal SNP position
+#PSY2 v6 is 24153419 - 24156720
+#with cushion of 20kb on either side: PSY2region = 24133419 - 24176720
+
+ggsave(filename=paste0(project_path, "figures/DM_GWAS_wPSY2KASPand5PCs_", dataset, 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+```
+
+3) TCHART with PSY2 KASP and 5 PCs
+```{r}
+TCHART_PSY2PCs_SNP_results_df$POS <- as.numeric(TCHART_PSY2PCs_SNP_results_df$POS)
+TCHART_PSY2PCs_SNP_results_df$Pr <- as.numeric(TCHART_PSY2PCs_SNP_results_df$Pr)
+TCHART_results <- TCHART_PSY2PCs_SNP_results_df %>% arrange(as.numeric(CHROM), as.numeric(POS))
+
+#order factor levels so they display in order of chromosome
+TCHART_results$SNP_ID <- factor(TCHART_results$SNP_ID, levels = TCHART_results$SNP_ID)
+TCHART_results$CHROM <- as.factor(TCHART_results$CHROM)
+TCHART_results$CHROM <- factor(TCHART_results$CHROM, levels = as.character(c(1:18)))
+
+
+#set color scheme
+colPalette <- rep(c("blue4","pink3"),9)
+
+## Plot Manhattan with bivariate Wald test p-values
+ggplot(TCHART_results, aes(x=POS, y=-log10(Pr))) +
+  geom_point(aes(color=CHROM), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("Univariate GWAS for TCHART with PSY2 KASP and 5 PCs")) +
+  guides(color="none")+
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(TCHART_results, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #causal SNP position
+#PSY2 v6 is 24153419 - 24156720
+#with cushion of 20kb on either side: PSY2region = 24133419 - 24176720
+
+ggsave(filename=paste0(project_path, "figures/TCHART_GWAS_wPSY2KASPand5PCs_", dataset, 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+```
+
+
+Zoom in on chromosome 1 QTL region: 
+Chr. 1 TCICHK
+```{r}
+chr1_results <- TCICHK_results %>% filter(CHROM == 1)
+
+#PSY2 v6 is 24153419 - 24156720
+#with cushion of 20kb on either side: PSY2region = 24133419 - 24176720 
+# haps_PSY2region <- readRDS(file=paste0(project_path, "data/Haplotypes_PSY2region_", dataset, ".RDS"))
+# PSY2regionSNPs <- paste0("S", gsub("_[A-Z]_[A-Z]$", "", colnames(haps_PSY2region))) #37 SNPs
+
+#genome matrix (after MAF filtering)
+genomat_SNPs <- read.table(file=paste0(project_path, "data/GenotypeMatrix_Named_", dataset, ".bimbam")) %>%
+  mutate(CHROM =  gsub("_[0-9].*", "",  SNP) %>% gsub("S","",.),
+         POS = as.numeric(sub("S[0-9]*_", "", SNP)))
+
+genomat_QTLregion <- genomat_SNPs %>% filter(CHROM=="1") # & POS > 20000000 & POS < 30000000
+rownames(genomat_QTLregion) <- genomat_QTLregion$SNP
+
+# Calculate LD with peak SNPs:
+
+#flag peaks and calculate LD 
+genomat_peaks_LD <- data.frame(SNP = genomat_QTLregion$SNP)
+
+topSNPs_chr1 <- chr1_results %>% filter(Pr < 0.001) %>% arrange(Pr)
+
+#calculate LD between each SNP and the peak 1 SNP
+peak1 <- topSNPs_chr1[1,]
+  LDmatrix_chr1 <- genomat_QTLregion %>% dplyr::select(-c(SNP, POS, CHROM, ALT, REF)) %>% #drop metadata non-numeric columns
+      t() %>% cor() #calculate correlation matrix
+    LDwithpeak1 <- LDmatrix_chr1[,paste0(peak1$SNP_ID)] #pull out correlation with peak1 SNP
+    genomat_peaks_LD$LDpeak1 <- LDwithpeak1
+    genomat_peaks_LD$Rsquared_peak1 <- genomat_peaks_LD$LDpeak1^2
+    
+#calculate LD between each SNP and the peak 2 SNP
+peak2 <- topSNPs_chr1[2,]
+    LDwithpeak2 <- LDmatrix_chr1[,peak2$SNP_ID]
+    genomat_peaks_LD$LDpeak2 <- LDwithpeak2
+    genomat_peaks_LD$Rsquared_peak2 <- genomat_peaks_LD$LDpeak2^2
+
+genomat_QTL_LD <- right_join(genomat_peaks_LD, genomat_QTLregion, by="SNP") %>%
+  mutate(peak1SNP = as.numeric(gsub("S1_", "", peak1$SNP)), peak2SNP = as.numeric(gsub("S1_", "", peak2$SNP))) %>%
+  mutate(distance_peak1 = POS - peak1SNP, distance_peak2 = POS - peak2SNP) %>%
+  mutate(isthispeak1 = case_when(SNP == peak1$SNP_ID ~ "yes", T ~ "no")) %>%
+  mutate(isthispeak2 = case_when(SNP == peak2$SNP_ID ~ "yes", T ~ "no")) %>%
+  dplyr::select(SNP, POS, CHROM, peak1SNP, peak2SNP, distance_peak1, distance_peak2, Rsquared_peak1, Rsquared_peak2, isthispeak1, isthispeak2) %>%
+  right_join(chr1_results %>% mutate(SNP=as.character(SNP_ID))) %>%
+  arrange(POS)
+
+## Plot chr 1 Manhattan with joint p-values, colored by LD with peak 1 SNP
+ggplot(genomat_QTL_LD %>% filter(POS > 20000000), aes(x=POS, y=-log10(Pr), color=Rsquared_peak1)) +
+  geom_point(aes(pch=isthispeak1, size=isthispeak1)) +
+  scale_color_gradient2(low = "blue", mid="orange", high = "red", midpoint = 0.5, name=
+                          expression(textstyle("R"^2*" with starred SNP")))+
+  scale_shape_manual(values = c(19,8)) +
+  scale_size_manual(values=c(0.8,1.2)) +
+  labs(y="-log10(p)", x="Chr. 1 physical position (bp)") +
+  ggtitle(paste0("TCICHK GWAS chr. 1 with PSY2 KASP and 5 PCs")) +
+  guides(pch="none", size="none") +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  theme(strip.background = element_rect(fill = "white")) +
+   annotate("segment", x = c(19400000, 19600000), xend = c(19600000, 19800000), y = c(-0.1, -0.1), yend = c(0.1, 0.1)) +
+  coord_cartesian(clip = "off", xlim = c(19000000, 35000000)) +
+  geom_vline(aes(xintercept=24155522), color="orange", lty="dashed") #causal SNP position
+
+ggsave(filename=paste0(project_path, "figures/TCICHK_GWAS_Chr1_wPSY2KASPand5PCs_Manhattan_wLD_peak1_", 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"))
+
+
+ggplot(genomat_QTL_LD %>% filter(POS > 20000000), aes(x=POS, y=-log10(Pr), color=Rsquared_peak2)) +
+  geom_point(aes(pch=isthispeak2, size=isthispeak2)) +
+  scale_color_gradient2(low = "blue", mid="orange", high = "red", midpoint = 0.5, name=
+                          expression(textstyle("R"^2*" with starred SNP")))+
+  scale_shape_manual(values = c(19,8)) +
+  scale_size_manual(values=c(0.8,1.2)) +
+  labs(y="-log10(p)", x="Chr. 1 physical position (bp)") +
+  ggtitle(paste0("TCICHK GWAS chr. 1 with PSY2 KASP and 5 PCs")) +
+  guides(pch="none", size="none") +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  theme(strip.background = element_rect(fill = "white")) +
+   annotate("segment", x = c(19400000, 19600000), xend = c(19600000, 19800000), y = c(-0.1, -0.1), yend = c(0.1, 0.1)) +
+  coord_cartesian(clip = "off", xlim = c(19000000, 35000000)) +
+  geom_vline(aes(xintercept=24155522), color="orange", lty="dashed") #causal SNP position
+
+ggsave(filename=paste0(project_path, "figures/TCICHK_GWAS_Chr1_wPSY2KASPand5PCs_Manhattan_wLD_peak2_", 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"))
+
+
+```
+
+Chr. 1 DM 
+```{r}
+chr1_results <- DM_results %>% filter(CHROM == 1)
+
+#genome matrix (after MAF filtering)
+# genomat_SNPs <- read.table(file=paste0(project_path, "data/GenotypeMatrix_Named_", dataset, ".bimbam")) %>%
+#   mutate(CHROM =  gsub("_[0-9].*", "",  SNP) %>% gsub("S","",.),
+#          POS = as.numeric(sub("S[0-9]*_", "", SNP)))
+# 
+# genomat_QTLregion <- genomat_SNPs %>% filter(CHROM=="1") # & POS > 20000000 & POS < 30000000
+# rownames(genomat_QTLregion) <- genomat_QTLregion$SNP
+
+# Calculate LD with peak SNPs:
+
+#flag peaks and calculate LD 
+genomat_peaks_LD <- data.frame(SNP = genomat_QTLregion$SNP)
+
+topSNPs_chr1 <- chr1_results %>% filter(Pr < 0.001) %>% arrange(Pr)
+
+#calculate LD between each SNP and the peak 1 SNP
+peak1 <- topSNPs_chr1[1,]
+  # LDmatrix_chr1 <- genomat_QTLregion %>% dplyr::select(-c(SNP, POS, CHROM, ALT, REF)) %>% #drop metadata non-numeric columns
+  #     t() %>% cor() #calculate correlation matrix
+    LDwithpeak1 <- LDmatrix_chr1[,paste0(peak1$SNP_ID)] #pull out correlation with peak1 SNP
+    genomat_peaks_LD$LDpeak1 <- LDwithpeak1
+    genomat_peaks_LD$Rsquared_peak1 <- genomat_peaks_LD$LDpeak1^2
+    
+#calculate LD between each SNP and the peak 2 SNP
+peak2 <- topSNPs_chr1[2,]
+    LDwithpeak2 <- LDmatrix_chr1[,peak2$SNP_ID]
+    genomat_peaks_LD$LDpeak2 <- LDwithpeak2
+    genomat_peaks_LD$Rsquared_peak2 <- genomat_peaks_LD$LDpeak2^2
+
+genomat_QTL_LD <- right_join(genomat_peaks_LD, genomat_QTLregion, by="SNP") %>%
+  mutate(peak1SNP = as.numeric(gsub("S1_", "", peak1$SNP)), peak2SNP = as.numeric(gsub("S1_", "", peak2$SNP))) %>%
+  mutate(distance_peak1 = POS - peak1SNP, distance_peak2 = POS - peak2SNP) %>%
+  mutate(isthispeak1 = case_when(SNP == peak1$SNP_ID ~ "yes", T ~ "no")) %>%
+  mutate(isthispeak2 = case_when(SNP == peak2$SNP_ID ~ "yes", T ~ "no")) %>%
+  dplyr::select(SNP, POS, CHROM, peak1SNP, peak2SNP, distance_peak1, distance_peak2, Rsquared_peak1, Rsquared_peak2, isthispeak1, isthispeak2) %>%
+  right_join(chr1_results %>% mutate(SNP=as.character(SNP_ID))) %>%
+  arrange(POS)
+
+
+## Plot chr 1 Manhattan with joint p-values, colored by LD with peak 1 SNP
+ggplot(genomat_QTL_LD %>% filter(POS > 20000000), aes(x=POS, y=-log10(Pr), color=Rsquared_peak1)) +
+  geom_point(aes(pch=isthispeak1, size=isthispeak1)) +
+  scale_color_gradient2(low = "blue", mid="orange", high = "red", midpoint = 0.5, name=
+                          expression(textstyle("R"^2*" with starred SNP"))) +
+  scale_shape_manual(values = c(19,8)) +
+  scale_size_manual(values=c(0.8,1.2)) +
+  labs(y="-log10(p)", x="Chr. 1 physical position (bp)") +
+  ggtitle(paste0("DM GWAS chr. 1 with PSY2 KASP and 5 PCs")) +
+  guides(pch="none", size="none") +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  theme(strip.background = element_rect(fill = "white")) +
+   annotate("segment", x = c(19400000, 19600000), xend = c(19600000, 19800000), y = c(-0.1, -0.1), yend = c(0.1, 0.1)) +
+  coord_cartesian(clip = "off", xlim = c(19000000, 35000000)) +
+  geom_vline(aes(xintercept=24155522), color="orange", lty="dashed") #causal SNP position
+
+ggsave(filename=paste0(project_path, "figures/DM_GWAS_Chr1_wPSY2KASPand5PCs_Manhattan_wLD_peak1_", 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"))
+
+
+## Plot chr 1 Manhattan with joint p-values, colored by LD with peak 1 SNP
+ggplot(genomat_QTL_LD %>% filter(POS > 20000000), aes(x=POS, y=-log10(Pr), color=Rsquared_peak2)) +
+  geom_point(aes(pch=isthispeak2, size=isthispeak2)) +
+  scale_color_gradient2(low = "blue", mid="orange", high = "red", midpoint = 0.5, name=
+                          expression(textstyle("R"^2*" with starred SNP"))) +
+  scale_shape_manual(values = c(19,8)) +
+  scale_size_manual(values=c(0.8,1.2)) +
+  labs(y="-log10(p)", x="Chr. 1 physical position (bp)") +
+  ggtitle(paste0("DM GWAS chr. 1 with PSY2 KASP and 5 PCs")) +
+  guides(pch="none", size="none") +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  theme(strip.background = element_rect(fill = "white")) +
+   annotate("segment", x = c(19400000, 19600000), xend = c(19600000, 19800000), y = c(-0.1, -0.1), yend = c(0.1, 0.1)) +
+  coord_cartesian(clip = "off", xlim = c(19000000, 35000000)) +
+  geom_vline(aes(xintercept=24155522), color="orange", lty="dashed") #causal SNP position
+
+ggsave(filename=paste0(project_path, "figures/DM_GWAS_Chr1_wPSY2KASPand5PCs_Manhattan_wLD_peak2_", 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"))
+```
+
+
+
+
+
+
+Other traits univariate results:
+```{r}
+GWAStraits <- c("RTWT", "HI","SPRTPERC", "FRYLD", "CMD3S", "CMD3I") #"DYLD"
+compileddates <- c("0910", "0712", "0712", "0712", "0714", "0714")
+PCstatus <- "wPCs"
+
+for(i in seq_along(GWAStraits)){
+  
+  #select trait
+  traitname <- GWAStraits[i]
+  rundate <- compileddates[i]
+
+  #read in results
+  traiti_results_df <- readRDS(file=paste0(project_path,
+               "output/univariate_models/", traitname, "_allSNPeffects_df", 
+               PCstatus, "_", dataset, "_", rundate, ".RDS")) %>%
+    mutate(POS = as.numeric(POS)) %>%
+    arrange(as.numeric(CHROM), POS) %>%
+    mutate(SNP_ID = factor(SNP_ID, levels = SNP_ID), 
+           CHROM = as.factor(CHROM))
+#order factor levels so they display in order of chromosome
+#(needs to be outside of pipe for some reason or it doesn't work)
+traiti_results_df$CHROM <- factor(traiti_results_df$CHROM, levels = as.character(c(1:18)))
+
+              
+  ## Make Q-Q plot 
+  
+  png(paste0(project_path, "figures/", traitname, "_QQplot_", PCstatus, "_", dataset, "_",
+                    format(Sys.time(), "%m%d"), ".png"), 
+        width=6, height=6, res=250, units="in")
+  
+  qqman::qq(traiti_results_df$Pr, main=paste0(traitname, " ", PCstatus))
+
+  dev.off()
+
+  ## Plot Manhattan with bivariate Wald test p-values
+  
+  #set color scheme
+  colPalette <- rep(c("blue4","pink3"),9)
+  
+  Manhattanplot <- ggplot(traiti_results_df, aes(x=POS, y=-log10(Pr))) +
+      geom_point(aes(color=CHROM), size=0.5) +
+      scale_color_manual(values=colPalette) +
+      labs(y="-log10(p)", x="Chromosome physical position") +
+      ggtitle(paste0("Univariate GWAS for ", traitname, " ", PCstatus)) +
+      guides(color="none") +
+      geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+      facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+        theme(legend.position = "none",
+              strip.background = element_rect(fill = "white"),
+              axis.text.x = element_blank(),  # Remove x-axis text
+              axis.ticks.x = element_blank(),
+              panel.spacing = unit(0, "lines"))
+      #+geom_vline(data = subset(DYLD_results, CHROM=="1"), 
+      #    aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+
+  print(Manhattanplot)
+  
+  ggsave(Manhattanplot, filename=paste0(project_path, "figures/", traitname,
+                                        "_univariateGWAS_", PCstatus, "_", dataset, 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+}
+```
+
+
+
+
+
+
+
+
+DYLD without PCs
+```{r}
+DYLD_noPCs_SNP_results_df <- readRDS(file=paste0(project_path,
+             "output/univariate_models/DYLD_allSNPeffects_dfnoPCs_", dataset, "_",
+             "0612", ".RDS"))
+
+qqman::qq(DYLD_noPCs_SNP_results_df$Pr, main="DYLD without PCs")
+
+
+DYLD_noPCs_SNP_results_df$POS <- as.numeric(DYLD_noPCs_SNP_results_df$POS)
+DYLD_results <- DYLD_noPCs_SNP_results_df %>% arrange(as.numeric(CHROM), as.numeric(POS))
+
+#order factor levels so they display in order of chromosome
+DYLD_results$SNP_ID <- factor(DYLD_results$SNP_ID, levels = DYLD_results$SNP_ID)
+DYLD_results$CHROM <- as.factor(DYLD_results$CHROM)
+DYLD_results$CHROM <- factor(DYLD_results$CHROM, levels = as.character(c(1:18)))
+
+
+#set color scheme
+colPalette <- rep(c("blue4","pink3"),9)
+
+## Plot Manhattan with bivariate Wald test p-values
+ggplot(DYLD_results, aes(x=POS, y=-log10(Pr))) +
+  geom_point(aes(color=CHROM), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("Univariate GWAS for DYLD")) +
+  guides(color="none")+
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines"))
+  #+geom_vline(data = subset(DYLD_results, CHROM=="1"), 
+  #           aes(xintercept=24155522), color="orange", lty="dashed") #causal SNP position
+#PSY2 v6 is 24153419 - 24156720
+#with cushion of 20kb on either side: PSY2region = 24133419 - 24176720
+
+ggsave(filename=paste0(project_path, "figures/DYLD_GWAS_PSY2cluster_noPCs_", dataset, 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+```
+
+

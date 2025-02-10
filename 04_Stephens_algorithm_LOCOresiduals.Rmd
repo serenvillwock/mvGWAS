@@ -1,0 +1,461 @@
+---
+title: "04_Stephens_algorithm_LOCOresiduals"
+output: html_document
+date: "2024-02-08"
+---
+
+---
+title: "04_run_Stephens2013"
+output: html_document
+date: "2023-11-08"
+---
+
+# About
+Run GWAS with Stephens 2013 Bayesian framework.
+  - Inputs: Imputed and filtered genotype file
+  - Outputs: BF results table
+
+# Setup
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse); library(Matrix); library(asreml); library("ggVennDiagram")
+project_path <- "/workdir/ssv42/mvGWAS/"
+setwd(project_path)
+set.seed(14850)
+
+# Set the PATH so we can access bcftools and other software from Rstudio
+Sys.setenv(PATH = "/usr/share/Modules/bin:/programs/docker/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/usr/Arcconf:/programs/bin:/programs/bin/mummer:/programs/bin/util:/programs/bin/bowtie:/programs/bin/bwa:/programs/bin/cufflinks:/programs/bin/tophat:/programs/bin/fastx:/programs/bin/blast:/programs/bin/blat:/programs/bin/perlscripts:/programs/bin/labutils:/programs/bin/gnuplot:/programs/bin/seqclean:/programs/bin/blast+:/programs/bin/sra:/programs/bin/bedtools/bin:/programs/bin/plink:/programs/bin/fastqc:/programs/bin/bowtie2:/programs/bin/clustalw:/programs/bin/rsem:/programs/bin/vcftools:/programs/RepeatMasker:/programs/bin/exonerate/bin:/programs/augustus/bin:/programs/bin/structure:/programs/bin/irods:/programs/bin/bedops:/programs/iv/x86_64/bin:/usr/lib64/openmpi/bin:/programs/texlive/bin/x86_64-linux:/programs/R-4.0.5-r9/bin:/programs/samtools-1.18/bin:/programs/bcftools-1.18/bin:/programs/htslib-1.18/bin:/home/ssv42/.local/bin:/home/ssv42/bin:/usr/Arcconf")
+```
+
+Select which dataset to work with:
+```{r}
+#Select dataset
+dataset <- "CASS" # "HP" #
+print(paste0("working with ", dataset, " data"))
+
+
+if(dataset=="CASS"){
+  VCFname <- "AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered_deduped"
+} else if(dataset=="HP"){
+  VCFname <- "AllChrom_YellowGenotypes_REF19imputedAndFiltered"
+}
+```
+
+
+
+# Use Algorithm S.1.1  from Stephens 2013
+- Computes single SNP Bayes Factors
+- V[U,D] = submatrix of V consisting of the rows with indices in the set U and columns with indices in the set D
+- For a given partition \gamma = (U,D,I), we can compute the Bayes Factor for all p SNPs
+
+Account for population structure
+For each chromosome: leave one out, fit regression model, and extract residuals.
+
+```{r, eval=F}
+#Calculate relationship matrix leaving each chromosome out 
+
+# Read in subsetted genotype data matrix
+genodata <- read.table(file=paste0(project_path, "data/GenotypeMatrix_", dataset, ".bimbam"))[,-c(1:3)]
+
+# Reattach SNP and sample names
+bimbamSNPorder <- read.table(file=paste0(project_path, "data/SNPorder_", dataset, ".txt", col.names=F, row.names=F))[,1] 
+sample_names <- readRDS(file=paste0(project_path, "data/BimbamSampleNames_",dataset,".RDS"))
+rownames(genodata) <- bimbamSNPorder
+colnames(genodata) <- sample_names
+
+# Recode genotypes as {-1, 0, 1} for rrBLUP::A.mat() and transpose
+genodata_recode <- genodata %>% t() %>% as.matrix() - 1
+
+
+for (j in 1:18){
+  # calculate LOCO K
+  genodata_LOCO <- genodata_recode[,grepl(paste0("S",j, "_"), bimbamSNPorder) == F] #exclude chromosome j
+  Amat_LOCO <- rrBLUP::A.mat(genodata_LOCO, n.core = 25) #calculate relationship matrix
+  
+  print(paste0("finished chr ", j, " rel matrix"))
+  saveRDS(Amat_LOCO, file=paste0(project_path, "data/LOCO_relationship_matrices/", dataset, "_Amat_LOCO_chr",j,".RDS"))
+}
+
+#confirm correct dimensions and sample order
+dim(Amat_LOCO)[1] == length(sample_names) 
+sum(rownames(Amat_LOCO) != sample_names) == 0
+#checked that there are ~1s on the diagonal
+round(mean(diag(as.matrix(Amat_LOCO)))) == 1
+```
+
+```{r} 
+# Run models for each chromosome using LOCO relationship mat
+
+# Load transformed and outlier-removed data
+trialdat_cleaned <- readRDS(file=paste0(project_path, "data/trialdata_cleaned_", dataset, ".RDS"))
+traitnames <- c("TCICHK", "DM") #just these for now
+
+# Subset for accessions with genotypes
+trialdat_sub <- trialdat_cleaned %>%
+  filter(germplasmName %in% sample_names) %>%
+  mutate(blockNumber = as.factor(blockNumber)) %>%
+  mutate(germplasmName = as.factor(germplasmName) %>% droplevels())
+
+#initiate storage 
+allchrom_resid_storage <- as.list(rep(NA,18))
+allchrom_model_storage <- as.list(rep(NA,18))
+
+for (j in 1:18){
+  print(paste0("leaving out chromosome ", j))
+  #initiate model storage for this chromosome 
+  model_storage <- list()
+  resid_storage <- data.frame(germplasmName = sample_names)
+  H2_storage <- data.frame()
+  
+  for(i in seq_along(traitnames)){ 
+    
+    traiti <- traitnames[i]; print(traiti)
+    
+    #fixedformula <- formula(paste0( traiti, "~ 1 + locationName:studyYear"))
+    fixedformula <- formula(paste0( traiti, "~ 1"))
+
+    
+    Amat_LOCO <- readRDS(file=paste0(project_path, "data/LOCO_relationship_matrices/", dataset, "_Amat_LOCO_chr",j,".RDS")) 
+    Amat_LOCO_notsing <- Amat_LOCO + diag(.0005, dim(Amat_LOCO)) #add value to diagonal to ensure it can invert
+    
+    
+    trymodelfit <- tryCatch(
+      modi <- asreml(data=trialdat_sub, trace=F,
+                     fixedformula,
+                     random = ~ vm(germplasmName, Amat_LOCO_notsing) ),
+      error=function(e) e)
+    
+    #+ germplasmName:locationName:studyYear + studyName:blockNumber
+    
+    
+    if(!inherits(trymodelfit, "error") && trymodelfit$converge == TRUE){ #if the model converged:
+      print(paste0(traiti, " model fit"))
+      model_storage[[i]] <- modi #store full model
+      
+      #extract residuals
+      indvl_resids <- cbind(data.frame(modi$mf), modi$residuals) %>%
+        group_by(germplasmName) %>%
+        summarise(mean_resid = mean(e, na.rm=T)) %>%
+        dplyr::select(germplasmName, mean_resid) %>%
+        rename_with(~ paste0(traiti), mean_resid)
+
+      resid_storage <- left_join(resid_storage, indvl_resids, by="germplasmName")
+  
+    } 
+    else{ #if there was a problem with the model, use NA as placeholders in storage vectors
+      print(paste0(traiti, " model failed to converge")) 
+      model_storage[[i]] <- NA
+       resid_storage <- cbind(resid_storage, rep(NA, length(unique(trialdat_cleaned$germplasmName))))
+       colnames(resid_storage)[1+i] <- traiti
+      }
+  } #end this trait
+
+  ### Save checkpoint for data from this chromosome left out ###
+  #Save data from this chromosome left out
+  allchrom_resid_storage[[j]] <- resid_storage
+  allchrom_model_storage[[j]] <- model_storage
+  
+} #end this chromosome
+
+saveRDS(allchrom_resid_storage, file=paste0(project_path, "data/LOCO_relationship_matrices/", 
+                                            dataset, "_LOCOresids_allchroms.RDS"))
+```
+
+Reformat residuals as phenotype matrix
+```{r}
+#read in the residuals
+ResidData <- readRDS(paste0(project_path, "data/LOCO_relationship_matrices/", dataset, "_LOCOresids_allchroms.RDS"))
+
+#put into one dataframe
+all_loco_resids <- data.frame(germplasmName = ResidData[[1]][,1])
+for (i in 1:18){
+  colnames(ResidData[[i]])[2:3] <- c(paste0(colnames(ResidData[[i]])[2], "_LOCO_",i),
+                                     paste0(colnames(ResidData[[i]])[3], "_LOCO_",i))
+  all_loco_resids <- left_join(all_loco_resids, ResidData[[i]], by="germplasmName")
+}
+
+#check order is still correct
+sum(all_loco_resids$germplasmName != sample_names) == 0
+rownames(all_loco_resids) <- all_loco_resids$germplasmName
+
+#write out Y matrix
+write.table(all_loco_resids[,-1], file=paste0(project_path, "data/LOCO_Residsmatrix_", dataset, ".txt"), 
+             col.names=T, row.names=T)
+```
+
+
+Run Stephens 2013 algorithm on residuals for each chromosome:
+
+- Sigmaa controls the expected size of the effect of g on the elements of Y under H_all
+- Pi quantifies our belief that the SNP is associated with the phenotype in question
+```{r}
+source("./code/Stephens2013Algorithm.R")
+
+Y_all <- as.matrix(read.table(paste0(project_path, "data/LOCO_Residsmatrix_", dataset, ".txt"), header=T))
+G_all <- genodata_recode
+
+dim(Y_all)[1] == dim(G_all)[1]
+
+#Specify sigma_a, variance of the effect sizes
+sigmaa = c(0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.05, 0.07, 0.08, 0.09, 0.1, 0.15, 0.2)
+pi0 <- 0.001
+
+for (i in 1:18){
+  
+  Y_i <- as.matrix(Y_all[,c((2*i-1),2*i)]) #subset phenotype data for the residuals calculated without this chromosome
+  G_i <- G_all[,grepl(paste0("S",i,"_"), colnames(G_all))] #subset genotype data for this chromosome
+  
+  Stephens2013Test <- logBF.rankone.matrix(G=G_i,Y=Y_i,sigmaa,pi0=pi0,m=0)
+  saveRDS(Stephens2013Test, file=paste0(project_path, "output/Stephens2013Test_", dataset,"_Resids_Chr", i, "_", ".RDS"))
+}
+
+
+#Join results for each chromosome
+SNPannotation <- read.table(paste0(project_path, "data/SNPannotation_", dataset, ".txt"), 
+                            sep=",", col.names = c("ID", "POS", "CHR"))
+
+Results_BFs_all <- data.frame() #initiate storage
+for (i in 1:18){
+
+  Results_i <- readRDS(paste0(project_path, "output/Stephens2013Test_", 
+                              dataset,"_Resids_Chr", i, "_", ".RDS"))
+
+  Results_BFs <- data.frame(BFav=Results_i[["lbfav"]], 
+                 BFuni=Results_i[["lbfuni"]],
+                 BFall=Results_i[["lbfall"]][1,])
+  
+  Results_BFs$CHR <- i
+  
+  Results_BFs_all <- rbind(Results_BFs_all, Results_BFs)
+}
+
+# Reattach SNP annotation information
+SNPannots_i <- SNPannotation %>% filter(CHR == i)
+
+AnnotResults <- cbind(Results_BFs_all, SNPannotation[,-3])
+
+# Save results with timestamp
+saveRDS(AnnotResults, file=paste0(project_path, "output/Stephens2013Test_", 
+                                  dataset, "_Resids_AllChrom_", 
+                                  format(Sys.time(), "%Y%m%d_%H%M"), ".RDS"))
+```
+
+BFav = the overall evidence against the global null (both phenotypes are unassociated with the SNP)
+BFall = evidence that both phenotypes are directly associated with the SNP
+BFuni = evidence that one phenotype is directly associated and the other is indirectly associated
+
+The support for partition $\gamma$, relative to the global null hypothesis $H_0$, is given by the likelihood ratio, or Bayes Factor (BF).
+
+p0 corresponds to the posterior probability of $\gamma = 0 = Unassociated$, 
+p1 corresponds to $\gamma = 1 = Directly\ associated$, 
+p2 corresponds to $\gamma = 2 = Indirectly\ associated$
+
+
+
+Interpretation of the tests:
+1. Univariate test for TC: support for a direct association with TC and an indirect association with DM (TC in D, DM in I)
+2. Test for DM controlling for TC: support for a direct association with DM and no association with TC (TC in D, DM in U)
+3. Test for TC controlling for DM: support for a direct association with TC and no association with DM (TC in U, DM in D)
+4. General multivariate test: support for a direct association with both TC and DM (TC in D, DM in D)
+
+
+## Analyze results
+Make Manhattan-esque plots with Bayes Factors
+```{r}
+# Get filename of most recent run
+system(paste0( "ls ", project_path, "output/Stephens2013Test_", dataset, "_Resids_AllChrom_* > ./recentruns.txt") )
+runnames <- read.table("./recentruns.txt") #need to change this selection for the last run
+lastrunname <- runnames[nrow(runnames),]
+print(lastrunname)
+
+Results <- readRDS(file=lastrunname)
+
+colPalette <- rep(c("blue4","pink3"),9)
+xaxisticks <- Results %>% group_by(CHR) %>% summarise(midpt = nth(ID, round(n()/2))) %>% as.data.frame() 
+  
+Results$ID <- factor(Results$ID, levels = Results$ID)
+Results$CHR <- as.factor(Results$CHR)
+
+
+## Plot Manhattan with BFav
+ggplot(Results, aes(x=ID, y=BFav)) +
+  geom_point(aes(color=CHR), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="log10(Bayes Factor average)") +
+  scale_x_discrete(name="chromosome", breaks=xaxisticks$midpt, labels=c(1:18)) +
+  ggtitle(paste0("Stephens Associations for TC & DM with LOCO model residuals, ", 
+                 dataset, " dataset")) +
+  guides(color="none")
+  #+ geom_hline(yintercept = Bf.cutoff, linetype="dashed", lwd=0.4)
+
+ggsave(filename=paste0("./figures/StephensManhattan_", dataset, 
+                       "_ResidsTest_LOCO_BFav_", Sys.Date(),".jpg"))
+
+
+
+## Plot Manhattan with BFall
+ggplot(Results, aes(x=ID, y=BFall)) +
+  geom_point(aes(color=CHR), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="log10(Bayes Factor all)") +
+  scale_x_discrete(name="chromosome", breaks=xaxisticks$midpt, labels=c(1:18)) +
+  ggtitle(paste0("Stephens Associations for TC & DM with LOCO model residuals, ", 
+                 dataset, " dataset")) +
+  guides(color="none")
+  #+ geom_hline(yintercept = Bf.cutoff, linetype="dashed", lwd=0.4)
+
+ggsave(filename=paste0("./figures/StephensManhattan_", dataset, 
+                       "_ResidsTest_LOCO_BFall_", Sys.Date(),".jpg"))
+
+
+## Plot Manhattan with BFuni
+ggplot(Results, aes(x=ID, y=BFuni)) +
+  geom_point(aes(color=CHR), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="log10(Bayes Factor univariate)") +
+  scale_x_discrete(name="chromosome", breaks=xaxisticks$midpt, labels=c(1:18)) +
+  ggtitle(paste0("Stephens Associations for TC & DM with LOCO model residuals, ", 
+                 dataset, " dataset")) +
+  guides(color="none")
+  #geom_hline(yintercept = Bf.cutoff, linetype="dashed", lwd=0.4)
+
+ggsave(filename=paste0("./figures/StephensManhattan_", dataset, "_ResidsTest_LOCO_BFuni_", 
+                       Sys.Date(),".jpg"))
+```
+
+
+Merge Stephens and GEMMA results for all SNPs:
+```{r}
+# Set SNP info as factors
+Results$ID <- factor(Results$ID, levels = Results$ID)
+Results$CHR <- as.factor(Results$CHR)
+Results$SNP <- gsub("S","", Results$ID)
+
+
+# Read in GEMMA mv results
+nPCs <- 3
+# Get filename of most recent GEMMA run
+# system(paste0( "ls ", project_path, "output/GEMMA_combined_", nPCs, "PCs_", 
+#                dataset, "*.assoc.txt > ./recentruns.txt") )
+system(paste0( "ls ", project_path, "output/GEMMA_combined_", nPCs, "PCs_", dataset, "* > ./recentruns.txt") )
+runnames <- read.table("./recentruns.txt")
+lastrunname <- runnames[nrow(runnames),]
+print(lastrunname)
+
+# Read in GEMMA results
+GEMMAMVresults <- readRDS(lastrunname) %>%
+  mutate(CHR=as.factor(chr), SNP=as.factor(gsub("S","",rs)), BP=ps)
+
+
+# Establish significance cutoffs
+BFcutoff <- 4
+alpha <- 0.05
+#Gao modified Bonferroni 
+Meff_chrom <- readRDS(file="./data/Meff_perchrom_estimates.RDS")
+Meff <- sum(Meff_chrom)
+Gao.cutoff <- alpha/Meff
+logPcutoff <- 3 #more flexible than -log10(Gao.cutoff)
+
+
+# Join results and annotate effect direction
+BothResults <- left_join(Results, GEMMAMVresults, by=c("SNP","CHR")) %>%
+  mutate(lowP = case_when(-log10(mvP) >= logPcutoff ~ 'T', T ~ 'F')) %>%
+  mutate(highBF = case_when(BFall >= BFcutoff ~ 'T', T ~ 'F')) %>%
+  mutate(effectdir = case_when(beta_1 > 0 & beta_2 > 0 | beta_1 < 0 & beta_2 < 0 ~ 'same',
+                               beta_1 > 0 & beta_2 < 0 | beta_1 < 0 & beta_2 > 0 ~ 'opposite', T ~ NA)) 
+
+
+colPalette <- rep(c("blue4","pink3"),9)
+xaxisticks <- BothResults %>% group_by(CHR) %>% summarise(midpt = nth(ID, round(n()/2))) %>% as.data.frame() 
+
+ggplot(BothResults, aes(x=ID, y=BFall)) +
+  geom_point(aes(color=effectdir, pch=lowP), size=1) +
+  scale_color_manual(values=colPalette) +
+  scale_shape_manual(values=c(19, 8)) +
+  labs(y="log10(Bayes Factor all)") +
+  scale_x_discrete(name="chromosome", breaks=xaxisticks$midpt, labels=c(1:18)) +
+  ggtitle("Multivariate Direct Associations for both TC and DM with LOCO residuals method") +
+  guides(color=guide_legend("effect direction"), 
+         shape=guide_legend("Significance")) +
+  geom_vline(xintercept="S1_24155945", color="orange", lty="dashed") #closest to PSY2
+  # + geom_hline(yintercept = BFcutoff, linetype="dashed", lwd=0.4) 
+
+ggsave(filename=paste0(project_path, "figures/StephensManhattan_", dataset,"_LOCO_BFall-GEMMA_unified_", Sys.Date(),".jpg"))
+
+```
+
+
+Look at marker effect estimates:
+```{r, eval=F}
+promisingSNPs <- BothResults %>% filter(lowP == 'T' | highBF == 'T') %>% arrange(-BFall) %>% group_by(chr) %>%
+  slice_max(order_by = BFall, n = 1) %>% as.data.frame()
+
+pleioSNPs <- BothResults %>% filter(lowP == 'T' & highBF == 'T') %>% arrange(-BFall)
+nrow(pleioSNPs)
+
+GEMMAtopSNPs <- BothResults %>% filter(lowP == 'T') %>% arrange(-BFall)
+nrow(GEMMAtopSNPs)
+
+uniSNPs <- BothResults %>% filter(lowP == 'T' & highBF == 'F') %>% arrange(BFall)
+nrow(uniSNPs)
+
+
+#Read in original (transformed) phenotype data
+Phenos <- readRDS(file=paste0(project_path, "data/trialdata_subset_", dataset, ".RDS"))
+  
+phenos_genos <- Phenos 
+for(i in 1:nrow(promisingSNPs)){
+  
+  SNPi <- as.character(promisingSNPs[i,"ID"])
+  
+  TopSNPGenotypes <- as.data.frame(t(genodata[grep(SNPi, rownames(genodata)),])) 
+  TopSNPGenotypes[,1] <- as.factor(TopSNPGenotypes[,1])
+  TopSNPGenotypes$germplasmName <- rownames(TopSNPGenotypes)
+
+  phenos_genos <- left_join(phenos_genos, TopSNPGenotypes, by="germplasmName") 
+}
+phenos_genos <- as.data.frame(phenos_genos)
+
+
+#Read in BLUP data
+BLUPs <- readRDS(file=paste0(project_path, "data/alltrait_drgBLUPs_", dataset, ".RDS"))
+  
+BLUP_genos <- BLUPs 
+for(i in 1:nrow(promisingSNPs)){
+  
+  SNPi <- as.character(promisingSNPs[i,"ID"])
+  
+  TopSNPGenotypes <- as.data.frame(t(genodata[grep(SNPi, rownames(genodata)),])) 
+  TopSNPGenotypes[,1] <- as.factor(TopSNPGenotypes[,1])
+  TopSNPGenotypes$germplasmName <- rownames(TopSNPGenotypes)
+
+  BLUP_genos <- left_join(BLUP_genos, TopSNPGenotypes, by="germplasmName")
+}
+BLUP_genos <- as.data.frame(BLUP_genos)
+
+
+for(i in 1:10){ #look at top 10 promising SNPs
+  SNPi <- as.character(promisingSNPs[i, "ID"])
+  
+  BLUP_genos_toplot <- BLUP_genos %>% filter(!is.na(.data[[SNPi]]))
+  
+  TCboxplot <- ggplot(BLUP_genos_toplot) +
+    geom_boxplot(aes(x=.data[[SNPi]], y=TCICHK), color="orange") +
+    ggtitle(paste0(SNPi, " effect on TC")) +
+    ylab("TCICHK BLUP")
+  
+  DMboxplot <- ggplot(BLUP_genos_toplot) +
+    geom_boxplot(aes(x=.data[[SNPi]], y=DM), color="blue") +
+    ggtitle(paste0(SNPi, " effect on DM")) +
+    ylab("DM BLUP")
+  
+  suppressWarnings(print(TCboxplot))
+  suppressWarnings(print(DMboxplot))
+}
+```
+
+
+
+
+
+
+

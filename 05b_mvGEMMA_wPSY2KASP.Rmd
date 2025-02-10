@@ -1,0 +1,395 @@
+---
+title: "05f_mvGEMMA_wPSY2KASP"
+output: html_document
+date: "2025-01-22"
+---
+
+Re-try the multivariate GEMMA GWAS with the PSY2 KASP marker as a covariate to see if the results are similar to the asreml approach.
+
+Load libraries
+```{r}
+setwd("/workdir/ssv42/mvGWAS/")
+library(parallel)
+project_path <- "/workdir/ssv42/mvGWAS/"
+dataset <- "CASS"
+ncores <- 80
+```
+
+
+Read in data:
+```{r}
+library(tidyverse)
+
+#read in genotype data
+genomat_KASP <- readRDS(file=paste0(project_path, "data/genomat_plusKASP_filtered.RDS"))
+genomat_ROG <- genomat_KASP %>% filter(SNP != "S1_24155522")
+Ginv_ROG <- readRDS(file=paste0(project_path, "data/Ginverse_ROG_sparse_CASS.RDS"))
+
+#read in phenotype data
+BLUPs_data <<- readRDS(file=paste0(project_path, "data/BLUPs_scaled_and_hap_data_", dataset, ".RDS")) 
+  
+#get PSY2 KASP marker covariate
+PSY2marker <- as.data.frame(t(genomat_KASP[genomat_KASP$SNP == "S1_24155522",] %>% dplyr::select(-c("SNP","ALT","REF","compute_group"))))
+  colnames(PSY2marker) <- "S1_24155522"
+  PSY2marker$germplasmName <- rownames(PSY2marker)
+  PSY2marker$S1_24155522_dom <- ifelse(PSY2marker$S1_24155522 == 1, 1, 0) 
+  
+#read in PC covariates
+PCaccessionnames <- read.table(file= paste0(project_path, "data/", dataset, "_accessionnames.txt"))[,1]
+dosagesPCA <- readRDS(file=paste0(project_path, "data/DosageMatrix_PCA_", dataset, ".RDS"))
+dosagesPC_sum <- summary(dosagesPCA) 
+dosagesPC <- as.data.frame(dosagesPCA$x)[,1:5]; dosagesPC$germplasmName <- PCaccessionnames
+  
+#Merge data together
+BLUPs_hap_data <- left_join(BLUPs_data, dosagesPC, by="germplasmName") %>%
+    left_join(PSY2marker, by="germplasmName") %>%
+    mutate(germplasmName = as.factor(germplasmName))
+
+```
+
+
+Prepare genotype input file for GEMMA:
+```{r}
+# Convert genotype matrix to bimbam format:
+genomat_bimbam <- genomat_ROG %>% dplyr::select(-compute_group)
+write.table(genomat_bimbam, file=paste0(project_path, "data/GenotypeMatrix_CASS_updated.bimbam"),
+          col.names = FALSE, row.names=FALSE, quote=FALSE, sep=", ")
+
+# Save list of sample names
+sample_names <- colnames(genomat_bimbam)[-c(1:3)]
+saveRDS(sample_names, file=paste0(project_path, "data/UpdatedBimbamSampleNames_",dataset,".RDS"))
+
+# Save list of SNP names
+bimbamSNPorder <- genomat_bimbam$SNP
+write.table(bimbamSNPorder, file=paste0(project_path, "data/UpdatedBimbamSNPorder_", dataset, ".txt", col.names=F, row.names=F)) 
+
+# Save SNP annotation file: Snp name, position, chromosome
+SNPannotation <- data.frame(bimbamSNPorder, gsub("S.*_","", bimbamSNPorder), 
+           gsub("_.*","", bimbamSNPorder) %>% gsub("S","", .))
+
+write.table(SNPannotation, file=paste0(project_path, "data/UpdatedBimbamSNPannotation_", dataset, ".txt"), col.names=F, row.names=F, sep=", ", quote=F)
+
+```
+
+Prepare phenotype input file for GEMMA:
+```{r}
+#Genotype file sample names and phenotype file sample names must be in the same order!!
+
+# Match genotype file names with BLUPs to ensure they are in the right order
+Ordered_BLUPs <- left_join(as.data.frame(sample_names), 
+                           BLUPs_hap_data, by="sample_names")
+  
+# Check that order and dimensions are still correct
+nrow(Ordered_BLUPs) == length(sample_names)
+sum(Ordered_BLUPs$germplasmName != sample_names) == 0
+
+# Write out phenotypes in format for GEMMA
+phenotype_file <- Ordered_BLUPs %>% dplyr::select(TCICHK:VIGOR)
+write.table(phenotype_file,
+            file=paste0(project_path, "data/UpdatedBLUPmatrix_scaled_", dataset, ".txt"), 
+            col.names=F, row.names=F)
+```
+
+Prepare relationship matrix for GEMMA, excluding PSY2 region:
+```{r}
+#Exclude the PSY2 region SNPs: ROG = rest of genome
+
+#Get names of SNPs in PSY2 region
+haps_PSY2region <- readRDS(file=paste0(project_path, "data/Haplotypes_PSY2region_", dataset, ".RDS"))
+PSY2regionSNPs <- paste0("S", gsub("_[A-Z]_[A-Z]$", "", colnames(haps_PSY2region)))
+#exclude PSY2 region SNPs (n=14)
+genomat_ROG <- genomat_bimbam %>% filter(!SNP %in% PSY2regionSNPs)
+
+#remove SNP info columns to make numeric matrix
+genomat_ROG_mat <- genomat_ROG %>%
+  dplyr::select(-c("SNP","ALT","REF")) 
+
+# Calculate relationship matrix
+genomat_t <- t(genomat_ROG_mat)
+colnames(genomat_t) <- genomat_ROG$SNP #assign marker names to columns
+#rownames(genomat_t) <- gsub("\\.","-", rownames(genomat_t)) #individuals in row names already set
+GMatrix_ROG <- ASRgenomics::G.matrix(M=genomat_t, method="VanRaden")[[1]]
+# colnames(GMatrix_ROG) <- gsub("\\.","-", colnames(GMatrix_ROG))
+# rownames(GMatrix_ROG) <- gsub("\\.","-", rownames(GMatrix_ROG))
+
+# Check GRM
+ck <- ASRgenomics::kinship.diagnostics(GMatrix_ROG)
+ck$list.duplicate
+ck$plot.diag
+ck$plot.offdiag 
+
+# Blend GRM & save
+Gblend <- ASRgenomics::G.tuneup(GMatrix_ROG, blend=TRUE, pblend=0.02)$Gb
+write.table(Gblend, file=paste0(project_path, "data/Gblended_ROG_", dataset, ".txt"),
+            col.names = F, row.names = F, quote = F)
+```
+
+Prepare covariates file for GEMMA:
+```{r}
+#make covariates file with first column 1 for intercept
+covs_PCs_PSY2 <- data.frame(1, BLUPs_hap_data %>% dplyr::select(PC1:S1_24155522_dom))
+colnames(covs_PCs_PSY2)[1] <- "intercept"
+
+# write out covariates file 
+write.table(covs_PCs_PSY2, 
+            file=paste0(project_path, "data/Covariates_forGEMMA_5PCs_PSY2KASP_", 
+                        dataset, ".txt"), 
+            col.names=F, row.names=F, quote=F)
+       
+```
+
+
+Run GEMMA:
+
+-n: specifies which traits to use in the BLUP matrix: TCICHK is column 1 and DM is column 3
+-lmm 4: specifies to calculate all the frequentist tests
+Note to self: Copy and paste command in the terminal to avoid occupying R while GEMMA is running
+
+#Bivariate for TC and DM
+```{bash}
+cd /workdir/ssv42/mvGWAS
+
+gemma -g ./data/GenotypeMatrix_CASS_updated.bimbam -p ./data/UpdatedBLUPmatrix_scaled_CASS.txt -k ./data/Gblended_ROG_CASS.txt -a ./data/UpdatedBimbamSNPannotation_CASS.txt -c ./data/Covariates_forGEMMA_5PCs_PSY2KASP_CASS.txt -lmm 4 -n 1 3 -maf 0.05 -o GEMMA_TC_DM_5PCs_PSY2KASP_CASS_012325
+```
+
+#Univariate TCICHK
+```{bash}
+gemma -g ./data/GenotypeMatrix_CASS_updated.bimbam -p ./data/UpdatedBLUPmatrix_scaled_CASS.txt -k ./data/Gblended_ROG_CASS.txt -a ./data/UpdatedBimbamSNPannotation_CASS.txt -c ./data/Covariates_forGEMMA_5PCs_PSY2KASP_CASS.txt -lm 4 -n 1 -maf 0.05 -o GEMMA_TCICHK_5PCs_Scaled_CASS_012325
+```
+
+#Univariate DM
+```{bash}
+gemma -g ./data/GenotypeMatrix_CASS_updated.bimbam -p ./data/UpdatedBLUPmatrix_scaled_CASS.txt -k ./data/Gblended_ROG_CASS.txt -a ./data/UpdatedBimbamSNPannotation_CASS.txt -c ./data/Covariates_forGEMMA_5PCs_PSY2KASP_CASS.txt -lm 4 -n 3 -maf 0.05 -o GEMMA_DM_5PCs_Scaled_CASS_012325
+```
+
+#Univariate TCHART
+```{bash}
+gemma -g ./data/GenotypeMatrix_CASS_updated.bimbam -p ./data/UpdatedBLUPmatrix_scaled_CASS.txt -k ./data/Gblended_ROG_CASS.txt -a ./data/UpdatedBimbamSNPannotation_CASS.txt -c ./data/Covariates_forGEMMA_5PCs_PSY2KASP_CASS.txt -lm 4 -n 2 -maf 0.05 -o GEMMA_TCHART_5PCs_Scaled_CASS_012325
+```
+
+#Multivariate TCICHK, TCHART, and DM
+```{bash}
+gemma -g ./data/GenotypeMatrix_CASS_updated.bimbam -p ./data/UpdatedBLUPmatrix_scaled_CASS.txt -k ./data/Gblended_ROG_CASS.txt -a ./data/UpdatedBimbamSNPannotation_CASS.txt -c ./data/Covariates_forGEMMA_5PCs_PSY2KASP_CASS.txt -lmm 4 -n 1 2 3 -maf 0.05 -o GEMMA_trivar_TCICHK_TCHART_DM_5PCs_Scaled_CASS_012325
+```
+
+
+# Examine TC/DM bivariate results:
+```{r}
+# Read in results
+MVresults <- read.table(file=paste0(project_path, "output/GEMMA_TC_DM_5PCs_PSY2KASP_CASS_012325.assoc.txt"), header=T) %>%
+  rename(CHR=chr, SNP=rs, BP=ps) 
+
+
+## QQ plot
+qqman::qq(MVresults$p_wald)
+qqman::qq(MVresults$p_lrt)
+qqman::qq(MVresults$p_score)
+
+## Set cutoffs 
+alpha <- 0.05
+#Gao modified Bonferroni 
+Meff_chrom <- readRDS(file="./data/Meff_perchrom_estimates.RDS")
+Meff <- sum(Meff_chrom)
+Gao.cutoff <- alpha/Meff
+
+
+#order factor levels so they display in order of chromosome
+MVresults$SNP <- factor(MVresults$SNP, levels = MVresults$SNP)
+MVresults$CHR <- as.factor(MVresults$CHR)
+MVresults$CHR <- factor(MVresults$CHR, levels = as.character(c(1:18)))
+
+
+## Plot Manhattan with bivariate Wald test p-values
+ggplot(MVresults, aes(x=BP, y=-log10(p_wald))) +
+  geom_point(aes(color=CHR), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="-log10(p_wald)", x="Chromosome physical position") +
+  ggtitle(paste0("GEMMA GWAS for TC and DM with PSY2 covariate and PCs")) +
+  guides(color="none")+
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHR, scales = "free_x", switch="x") +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(MVresults, CHR=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+#PSY2 v6 is 24153419 - 24156720
+
+ggsave(filename=paste0("./figures/GEMMA_TCDMmanhattan_5PCs_Scaled_CASS_pwald_", Sys.Date(),".jpg"))
+
+```
+GEMMA results are nearly identical to my asreml results when the inputs are the same. That's good!
+
+How similar is GEMMA relationship matrix to rrBLUPs?
+```{bash}
+#Make relationship matrix in GEMMA:
+gemma -g ./data/GenotypeMatrix_CASS_updated.bimbam -p ./data/UpdatedBLUPmatrix_scaled_CASS.txt -gk 2 -o Updated_GEMMAKMatrix
+```
+```{r}
+#check output is correct dimensions
+Kmat <-read.table(file=paste0("./output/Updated_GEMMAKMatrix.sXX.txt"))
+dim(Kmat) #378 by 378
+dim(Kmat)[1] == length(sample_names)
+
+mean(diag(as.matrix(Kmat))) #1 
+range(diag(as.matrix(Kmat))) #0.71 to 1.79
+```
+```{r}
+#compare to blended rrBLUP relationship matrix:
+#Gblend
+Kmat <-read.table(file=paste0("./output/KMatrix_CASS.sXX.txt"))
+
+library(pheatmap)
+
+pheatmap(as.matrix(Kmat),  cluster_rows = F, cluster_cols = F, show_rownames=F, show_colnames=F) # Cluster columns
+pheatmap(Gblend,  cluster_rows = F, cluster_cols = F, show_rownames=F, show_colnames=F) # Cluster columns
+```
+They are very similar.
+
+
+Check the residual genetic covariance:
+GEMMA output only gives the genetic covariance for the null model.
+```{bash}
+less ./output/GEMMA_TC_DM_5PCs_PSY2KASP_CASS_012325.log.txt
+```
+It's small, Vg_TCICHK = 0.0906481, Cov_TCDM = -0.0223354, Vg_DM = 0.195431
+But the Vg is also very small, why?
+Compared to asreml null model:
+Vg_TCICHK = 0.09586143, Cov_TCDM = -0.34348489, Vg_DM= 0.19910801
+
+
+Look at univariate TCICHK results:
+```{r}
+#read in TCICHK results
+TCICHKresults <- read.table(file=paste0(project_path, "output/GEMMA_TCICHK_5PCs_Scaled_CASS_012325.assoc.txt"), header=T) %>%
+  rename(CHR=chr, SNP=rs, BP=ps) 
+
+qqman::qq(as.numeric(TCICHKresults$p_wald), main="TCICHK with PSY2 KASP covariate and PCs, p_wald")
+qqman::qq(as.numeric(TCICHKresults$p_lrt), main="TCICHK with PSY2 KASP covariate and PCs, p_lrt")
+
+
+#order factor levels so they display in order of chromosome
+TCICHKresults$SNP <- factor(TCICHKresults$SNP, levels = TCICHKresults$SNP)
+TCICHKresults$CHR <- as.factor(TCICHKresults$CHR)
+TCICHKresults$CHR <- factor(TCICHKresults$CHR, levels = as.character(c(1:18)))
+
+
+#set color scheme
+colPalette <- rep(c("blue4","pink3"),9)
+
+## Plot Manhattan with bivariate Wald test p-values
+ggplot(TCICHKresults, aes(x=BP, y=-log10(p_wald))) +
+  geom_point(aes(color=CHR), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="-log10(p_lrt)", x="Chromosome physical position") +
+  ggtitle(paste0("GEMMA Univariate GWAS for TCICHK with PSY2 covariate and 5 PCs")) +
+  guides(color="none")+
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  facet_grid(. ~ CHR, scales = "free_x", switch="x") +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(TCICHKresults, CHR=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #causal SNP position
+```
+
+Examine univariate DM results:
+```{r}
+#read in TCICHK results
+DMresults <- read.table(file=paste0(project_path, "output/GEMMA_DM_5PCs_Scaled_CASS_012325.assoc.txt"), header=T) %>%
+  rename(CHR=chr, SNP=rs, BP=ps) 
+
+qqman::qq(as.numeric(DMresults$p_wald), main="DM with PSY2 KASP covariate and PCs, p_wald")
+qqman::qq(as.numeric(DMresults$p_lrt), main="DM with PSY2 KASP covariate and PCs, p_lrt")
+
+
+#order factor levels so they display in order of chromosome
+DMresults$SNP <- factor(DMresults$SNP, levels = DMresults$SNP)
+DMresults$CHR <- as.factor(DMresults$CHR)
+DMresults$CHR <- factor(DMresults$CHR, levels = as.character(c(1:18)))
+
+
+#set color scheme
+colPalette <- rep(c("blue4","pink3"),9)
+
+## Plot Manhattan with bivariate Wald test p-values
+ggplot(DMresults, aes(x=BP, y=-log10(p_wald))) +
+  geom_point(aes(color=CHR), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="-log10(p_lrt)", x="Chromosome physical position") +
+  ggtitle(paste0("GEMMA Univariate GWAS for DM with PSY2 covariate and 5 PCs")) +
+  guides(color="none")+
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  facet_grid(. ~ CHR, scales = "free_x", switch="x") +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(DMresults, CHR=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #causal SNP position
+```
+
+
+
+# Examine TCICHK/TCHART/DM trivariate results:
+Check null model genetic variance: './output/GEMMA_trivar_TCICHK_TCHART_DM_5PCs_Scaled_CASS_012325.log.txt'
+Vg_TCICHK = 0.0908225
+Vg_TCHART = 0.0528988
+Vg_DM = 0.204883
+Vcov_TCICHK_TCHART = 0.0624553
+Vcov_TCICHK_DM = -0.0258357
+Vcov_TCHART_DM = -0.0448664
+
+```{r}
+# Read in results
+TVresults <- read.table(file=paste0(project_path, "output/GEMMA_trivar_TCICHK_TCHART_DM_5PCs_Scaled_CASS_012325.assoc.txt"), header=T) %>%
+  rename(CHR=chr, SNP=rs, BP=ps) 
+
+## QQ plot
+qqman::qq(TVresults$p_wald)
+qqman::qq(TVresults$p_lrt)
+qqman::qq(TVresults$p_score)
+
+## Set cutoffs 
+alpha <- 0.05
+#Gao modified Bonferroni 
+Meff_chrom <- readRDS(file="./data/Meff_perchrom_estimates.RDS")
+Meff <- sum(Meff_chrom)
+Gao.cutoff <- alpha/Meff
+
+
+#order factor levels so they display in order of chromosome
+TVresults$SNP <- factor(TVresults$SNP, levels = TVresults$SNP)
+TVresults$CHR <- as.factor(TVresults$CHR)
+TVresults$CHR <- factor(TVresults$CHR, levels = as.character(c(1:18)))
+
+
+## Plot Manhattan with trivariate Wald test p-values
+ggplot(TVresults, aes(x=BP, y=-log10(p_wald))) +
+  geom_point(aes(color=CHR), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="-log10(p_wald)", x="Chromosome physical position") +
+  ggtitle(paste0("GEMMA trivariate GWAS for TCICHK, TCHART, & DM with PSY2 and 5 PCs")) +
+  guides(color="none")+
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHR, scales = "free_x", switch="x") +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(TVresults, CHR=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+#PSY2 v6 is 24153419 - 24156720
+
+ggsave(filename=paste0("./figures/GEMMA_TrivarManhattan_5PCs_Scaled_CASS_pwald_", Sys.Date(),".jpg"))
+
+```
+

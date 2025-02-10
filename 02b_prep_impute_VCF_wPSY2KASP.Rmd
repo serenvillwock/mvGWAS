@@ -1,0 +1,498 @@
+---
+title: "02a_prep_impute_VCFs"
+output: html_document
+date: "2024-02-08"
+---
+# About
+Imputation of PSY2 causal SNP, S1_24155522
+
+-   Inputs: Dart genotypes from HarvestPlus population & additional accessions from CASS project/Cassavabase download (`MergedYellowCASSGenotypes.vcf.gz`) and the reference imputation panel (`./imputation-panel/chr*_RefPanelAndGSprogeny_ReadyForGP_72719.vcf.gz`)
+-   Outputs: Imputered and filtered SNP set **including S1_24155522**, the PSY2 causal SNP
+
+Based on Marnin Wolfe's [NextGen Cassava GS pipeline](https://github.com/wolfemd/IITA_2021GS/) using tools from the `genomicMateSelectR` package.
+(Thanks Marnin!)
+Install with: devtools::install_github("wolfemd/genomicMateSelectR", ref = 'master') 
+
+# Setup
+```{r}
+library(genomicMateSelectR); library(tidyverse); library(magrittr)
+library(ggplot2); library(ggrepel); library(data.table)
+
+inpath <- "/workdir/ssv42/mvGWAS/data/"
+outName <- "/workdir/ssv42/mvGWAS/data/"
+```
+
+If running in Rstudio: set the PATH so we can access bcftools and other software from Rstudio
+(Note for future: better solution is to append the programs needed to the path string rather than copying all)
+```{r}
+# system(paste0("which bcftools"))
+# check PATH via: Sys.getenv()
+# check what it should be: echo $PATH in terminal
+# change PATH via: Sys.setenv(PATH = "/normal/path/to/user/programs/bin/when/in/terminal/")
+```
+
+
+Split the genome-wide VCF to per-chromosome VCF
+```{r, eval=F}
+require(furrr); plan(multisession, workers = 8)
+options(future.globals.maxSize=+Inf); options(future.rng.onMisuse="ignore")
+  
+vcfIn <- "/workdir/ssv42/mvGWAS/data/MergedYellowCASSGenotypes.vcf.gz"
+filters <-"--minDP 4 --maxDP 50" # because using GT not PL for impute (Beagle5)
+outPath <- "/workdir/ssv42/mvGWAS/data/"
+outSuffix <- "MergedYellowCASSGenotypes"
+
+future_map(1:18,
+           ~genomicMateSelectR::splitVCFbyChr(Chr=.,
+                                              vcfIn=vcfIn,filters=filters,
+                                              outPath=outPath,
+                                              outSuffix=outSuffix))
+plan(sequential)
+```
+
+
+There are missing sites in the reference panel from adding the KASP markers. First let's try to impute those.
+```{r}
+library(genomicMateSelectR)
+set_wd("/workdir/ssv42/mvGWAS/data/")
+refVCF <- "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/chr1_RefPanelAndGSprogeny_ReadyForGP_72719_plusKASP_dedup_sorted.vcf.gz"
+mapFile <-  "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/CassavaGeneticMap/chr1_cassava_cM_pred.v6_91019.map"
+outName <- "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/chr1_RefPanelAndGSprogeny_ReadyForGP_72719_plusKASP_dedup_sorted_imputed"
+
+nthreads=20;maxmem="500g";impute=TRUE;ne=100000;samplesToExclude=NULL
+  system(paste0("java -Xms2g -Xmx",maxmem," -jar /programs/beagle/beagle.jar ",
+                "gt=",refVCF," ",
+                "map=",mapFile," ",
+                "out=",outName," ",
+                "nthreads=",nthreads," impute=",impute," ne=",ne,
+                ifelse(!is.null(samplesToExclude),paste0(" excludesamples=",samplesToExclude),""))) 
+  
+  
+  
+#using version with only the complete set -- just phasing no imputation needed
+library(genomicMateSelectR)
+set_wd("/workdir/ssv42/mvGWAS/data/")
+#refVCF <- "/workdir/ssv42/mvGWAS/data/chr1_RefPanelAndGSprogeny_ReadyForGP_72719_plusKASP_intersectsubset_sort.vcf.gz"
+refVCF <- "/workdir/ssv42/mvGWAS/data/chr1_RefPanelAndGSprogeny_ReadyForGP_72719_plusKASP_completesetonly_sorted.vcf.gz"
+mapFile <-  "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/CassavaGeneticMap/chr1_cassava_cM_pred.v6_91019.map"
+outName <- "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/chr1_RefPanelAndGSprogeny_ReadyForGP_72719_plusKASP_intersectsubset_sorted_phased"
+
+nthreads=20;maxmem="500g";impute=FALSE;ne=100000;samplesToExclude=NULL
+  system(paste0("java -Xms2g -Xmx",maxmem," -jar /programs/beagle/beagle.jar ",
+                "gt=",refVCF," ",
+                "map=",mapFile," ",
+                "out=",outName," ",
+                "nthreads=",nthreads," impute=",impute," ne=",ne,
+                ifelse(!is.null(samplesToExclude),paste0(" excludesamples=",samplesToExclude),""))) 
+  
+```
+
+
+First need to append tag ("_A") to sample names so there are not duplicates between reference panel and target VCF apparently (Beagle complained). Used `bcftools reheader` for that.
+
+```{r}
+system(paste0("cd /workdir/ssv42/; bcftools query -l chr1_MergedYellowCASS_preimpute_Genotypes.vcf.gz > MergedYellowCASSsamplenames.txt"))
+
+samplenames <- read.table("/workdir/ssv42/MergedYellowCASSsamplenames.txt")
+samplenames_tagappend <- paste0(samplenames$V1, "_A")
+write.table(samplenames_tagappend, file="/workdir/ssv42/samplenames_tagappend.txt", col.names=F, row.names=F, quote=F)
+
+system(paste0("bcftools reheader -s samplenames_tagappend.txt -o chr1_MergedYellowCASS_preimpute_Genotypes_tagappend.vcf.gz chr1_MergedYellowCASS_preimpute_Genotypes.vcf.gz"))
+
+```
+
+
+
+Run imputation for chromosome one
+```{r, eval=F}
+library(genomicMateSelectR)
+
+targetVCFpath <- "/workdir/ssv42/mvGWAS/data/" # location of the targetVCF
+refVCFpath <- "/workdir/ssv42/mvGWAS/data/"
+mapPath <-  "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/CassavaGeneticMap/"
+outPath <- "/workdir/ssv42/mvGWAS/data/"
+outSuffix <- "/workdir/ssv42/mvGWAS/data/MergedYellowCASSImputed"
+
+
+# genomicMateSelectR::runBeagle5(targetVCF=paste0(targetVCFpath,
+#                                 "chr",1, "_MergedYellowCASSGenotypes_tagappend.vcf.gz"),
+#                                            refVCF=paste0(refVCFpath,"chr",1,
+#                               "_RefPanelAndGSprogeny_ReadyForGP_72719_plusKASP_dedup_sorted_imputed.vcf.gz"),
+#                                            mapFile=paste0(mapPath,"chr",1,
+#                                                           "_cassava_cM_pred.v6_91019.map"),
+#                                            outName=paste0(outPath,"chr",1,
+#                                                           "_YellowCASSGenotypes_REF19andKASPimputed"), nthreads=20)
+
+
+
+#updated version with only the complete set of overlapped Dart & KASP accessions as the reference (higher DR2 of 0.74 compared to 0.65 for S1_24155522)
+refVCFpath <- "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/"
+outPath <- "/workdir/ssv42/mvGWAS/data/"
+
+genomicMateSelectR::runBeagle5(targetVCF=paste0(targetVCFpath,
+                                "chr",1, "_YellowGenotypes.vcf.gz"), #"_MergedYellowCASSGenotypes.vcf.gz"),
+                                           refVCF=paste0(refVCFpath,"chr",1,
+"_RefPanelAndGSprogeny_ReadyForGP_72719_plusKASP_completesetonly_sorted_phased.vcf.gz"),
+                                           mapFile=paste0(mapPath,"chr",1,
+                                                          "_cassava_cM_pred.v6_91019.map"),
+                                           outName=paste0(outPath,"chr",1,
+                                                          "_YellowGenotypes_REF19andKASPimputed_wcompletesetonly"), nthreads=60)
+
+```
+
+Convert VCF to dosage matrix
+```{r}
+pathIn <- "/workdir/ssv42/mvGWAS/data/" # location of the targetVCF
+pathOut <- "/workdir/ssv42/mvGWAS/data/"
+
+genomicMateSelectR::convertVCFtoDosage(pathIn, pathOut, vcfName="chr1_YellowCASSGenotypes_REF19andKASPimputed_wcompletesetonly")
+```
+Output: `/workdir/ssv42/mvGWAS/data/chr1_YellowCASSGenotypes_REF19andKASPimputed_wcompletesetonly.raw`
+
+
+
+Merge the previous genotype matrix with this one including PSY2 SNP:
+```{r}
+project_path <- "/workdir/ssv42/mvGWAS/"
+
+genomat_SNPs <- read.table(file=paste0(project_path, "data/GenotypeMatrix_Named_CASS.bimbam"))
+colnames(genomat_SNPs) <-  gsub("\\.", "-", colnames(genomat_SNPs))
+
+KASP_imputed_SNPs <- read.table(file=paste0(project_path, "data/chr1_YellowCASSGenotypes_REF19andKASPimputed_wcompletesetonly.raw"), header = T)
+
+
+#remove genotyping tags
+rownames(KASP_imputed_SNPs) <- make.unique(gsub("_A.*", "", KASP_imputed_SNPs$IID) %>% gsub("\\.", "-",.))
+#quick fix for missing leading zero in accession name
+rownames(KASP_imputed_SNPs)[which(rownames(KASP_imputed_SNPs)=="IITA-TMS-IBA70593")] <- "IITA-TMS-IBA070593"
+
+
+#remove metadata
+KASP_imputed_SNPs_mat <- KASP_imputed_SNPs[,-c(1:6)]
+
+
+# Extract SNP information from the VCF
+system(paste0("bcftools query -f '%ID %ALT  %REF\n' ", project_path, "data/", "chr1_YellowCASSGenotypes_REF19andKASPimputed_wcompletesetonly.vcf.gz > ",
+              project_path, "data/KASPimputedSNPinfo.txt"))
+
+# Make a SNP annotation file
+system(paste0("bcftools query -f '%ID, %POS, %CHROM\n' ", project_path, "data/", "chr1_YellowCASSGenotypes_REF19andKASPimputed_wcompletesetonly.vcf.gz > ",
+              project_path, "data/KASPimputed_SNPannotation.txt"))
+
+# Transpose and join back with SNP info
+SNPinfo <- read.table(file=paste0(project_path, "data/KASPimputedSNPinfo.txt"))
+colnames(SNPinfo) <- c("SNP", "ALT", "REF")
+
+# Convert to bimbam format
+KASP_bimbam <- cbind( SNPinfo, t(KASP_imputed_SNPs_mat))
+
+# Join with original dataframe
+genomat_plusKASP <- full_join(genomat_SNPs, (KASP_bimbam %>% filter(SNP == "S1_24155522")))
+
+# Filter to original list of SNPs plus S1_24155522 
+#genomat_plusKASP_SNPfilt <- genomat_plusKASP %>% filter(SNP %in% c(genomat_SNPs$SNP, "S1_24155522"))
+
+# Filter to original list of accessions
+genomat_plusKASP_filtered <- genomat_plusKASP %>% dplyr::select(all_of(colnames(genomat_SNPs)))
+
+# Add column for compute_group
+nSNPs <- dim(genomat_plusKASP_filtered)[1]
+ncores <- 80
+genomat_plusKASP_filtered$compute_group <- as.numeric(cut_number(c(1:nSNPs), ncores))
+
+# Save new genotype matrix:
+saveRDS(genomat_plusKASP_filtered, file="/workdir/ssv42/mvGWAS/data/genomat_plusKASP_filtered.RDS")
+```
+
+**NOTE: in this file the favorable allele "A" is the reference allele at S1_24155522 and "C" is the alternate allele, so the effect direction is backwards, i.e. the "alt" allele should have a negative effect on TC and positive on DM**
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### OLD
+
+Post-impute filter.
+Standard post-imputation filter: AR2>0.75 (DR2>0.75 as of Beagle5.0), P_HWE>1e-20, MAF>0.005 [0.5%].
+Loop to filter all 18 VCF files in parallel
+```{r, eval=F}
+inPath <- "/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/"
+outPath <- "/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/"
+require(furrr); plan(multisession, workers = 18)
+future_map(1:18,
+           ~genomicMateSelectR::postImputeFilter(inPath=inPath,
+                                                 inName=paste0("chr",.,"_YellowGenotypes_REF19imputed"),
+                                                 outPath=outPath,
+                                                 outName=paste0("chr",.,"_YellowGenotypes_REF19imputedAndFiltered"),
+                                                 DR2thresh = 0.75,
+                                                 HWEthresh = 1e-20,
+                                                 MAFthresh = 0.05))
+plan(sequential)
+
+#check how many markers passed the filter:
+purrr::map(1:18,~system(paste0("zcat ",
+                               "/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/",
+                        "chr",.,"_YellowGenotypes_REF19imputedAndFiltered.vcf | wc -l")))
+```
+
+Merge chromosomes back together to make a genome-wide VCF:
+```{r, eval=F}
+## Index with tabix first
+future_map(1:18,~system(paste0("tabix -f -p vcf ",inPath,
+                               "chr",.,"_YellowGenotypes_REF19imputedAndFiltered.vcf.gz")))
+plan(sequential)
+
+## bcftools concat
+system(paste0("bcftools concat ",
+              "--output ",outPath,
+              "AllChrom_YellowGenotypes_REF19imputedAndFiltered.vcf.gz ",
+              "--output-type z --threads 10",
+              paste0(inPath,"chr",1:18,
+                     "_YellowGenotypes_REF19imputedAndFiltered.vcf.gz",
+                     collapse = " ")))
+
+## Convert to binary blink (bed/bim/fam)
+vcfName <- "AllChrom_YellowGenotypes_REF19imputedAndFiltered"
+system(paste0("export PATH=/programs/plink-1.9-x86_64-beta3.30:$PATH;",
+              "plink --vcf ",inPath,vcfName,".vcf.gz ",
+              "--make-bed --const-fid --keep-allele-order ",
+              "--out ",outPath,vcfName))
+
+## Check the final file:
+system(paste0("bcftools stats /workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/AllChrom_YellowGenotypes_REF19imputedAndFiltered.vcf.gz"))
+
+# There are now 51,708 SNPs
+# With MAF > 0.05, there are now 40,243 SNPs
+```
+This outputs the file `AllChrom_YellowGenotypes_REF19imputedAndFiltered.vcf.gz` with 51708 SNPs.
+
+
+
+Subset to filter out individuals from Ithaca project:
+```{r}
+pathIn <-"/workdir/ssv42/yellowGWAS/data/genotype_data/"
+pathOut <- pathIn
+vcfName <-"imputation-output/AllChrom_YellowGenotypes_REF19imputedAndFiltered.vcf.gz"
+
+system(paste0("bcftools view -S ",
+              pathIn, "samplenames_noITH.txt ",
+              "-O z -o ",
+              pathOut, "imputation-output/AllChrom_YellowGenotypes_REF19imputedAndFiltered_noITH.vcf.gz ",
+              pathIn, vcfName))
+```
+
+
+Merge with CASS project genotypes:
+MergeCassavabaseVCFs_wKASPmarkers.R > outputs **MergedYellowCASS_KASP_Genotypes.vcf.gz**
+
+Re-impute missing SNPs:
+Split the genome-wide VCF to per-chromosome VCF
+```{r, eval=F}
+require(furrr); plan(multisession, workers = 8)
+options(future.globals.maxSize=+Inf); options(future.rng.onMisuse="ignore")
+  
+vcfIn <- "/workdir/ssv42/yellowGWAS/data/genotype_data/MergedYellowCASS_KASP_Genotypes.vcf.gz"
+filters <-"--minDP 4 --maxDP 50" # because using GT not PL for impute (Beagle5)
+outPath <- "/workdir/ssv42/yellowGWAS/data/genotype_data/"
+outSuffix <- "MergedYellowCASSGenotypes"
+
+future_map(1:18,
+           ~genomicMateSelectR::splitVCFbyChr(Chr=.,
+                                              vcfIn=vcfIn,filters=filters,
+                                              outPath=outPath,
+                                              outSuffix=outSuffix))
+plan(sequential)
+```
+
+Run imputation one chromosome at a time
+```{r, eval=F}
+targetVCFpath <- "/workdir/ssv42/yellowGWAS/data/genotype_data/" # location of the targetVCF
+refVCFpath <- "/workdir/ssv42/yellowGWAS/data/ImputationRefPanel/"
+mapPath <-  "/workdir/ssv42/yellowGWAS/data/ImputationRefPanel/CassavaGeneticMap/"
+outPath <- "/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/"
+outSuffix <- "MergedYellowCASSGenotypesImp"
+
+purrr::map(1:18,
+           ~genomicMateSelectR::runBeagle5(targetVCF=paste0(targetVCFpath,"chr",.,
+                                                            "_MergedYellowCASSGenotypes.vcf.gz"),
+                                           refVCF=paste0(refVCFpath,"chr",.,
+                                                         "_RefPanelAndGSprogeny_ReadyForGP_72719.vcf.gz"),
+                                           mapFile=paste0(mapPath,"chr",.,
+                                                          "_cassava_cM_pred.v6_91019.map"),
+                                           outName=paste0(outPath,"chr",.,
+                                                          "_MergedYellowCASSGenotypes_REF19imputed"), nthreads=20))
+```
+
+Post-impute filter.
+Standard post-imputation filter: AR2>0.75 (DR2>0.75 as of Beagle5.0), P_HWE>1e-20, MAF>0.05 [5%].
+Loop to filter all 18 VCF files in parallel
+```{r, eval=F}
+inPath <- "/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/"
+outPath <- "/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/"
+require(furrr); plan(multisession, workers = 18)
+future_map(1:18,
+           ~genomicMateSelectR::postImputeFilter(inPath=inPath,
+                                                 inName=paste0("chr",.,"_MergedYellowCASSGenotypes_REF19imputed"),
+                                                 outPath=outPath,
+                                                 outName=paste0("chr",.,"_MergedYellowCASSGenotypes_REF19imputedFiltered"),
+                                                 DR2thresh = 0.75,
+                                                 HWEthresh = 1e-20,
+                                                 MAFthresh = 0.05))
+plan(sequential)
+
+#check how many markers passed the filter:
+purrr::map(1:18,~system(paste0("zcat ",
+                               "/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/",
+                        "chr",.,"_YellowGenotypes_REF19imputedFiltered.vcf | wc -l")))
+```
+
+Merge chromosomes back together to make a genome-wide VCF:'
+
+```{r, eval=F}
+## Index with tabix first
+inPath <- "/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/"
+outPath <- "/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/"
+future_map(1:18,~system(paste0("tabix -f -p vcf ",inPath,
+                               "chr",.,"_MergedYellowCASSGenotypes_REF19imputedFiltered.vcf.gz")))
+plan(sequential)
+
+## bcftools concat (note 1/29/24: not sure why I had to make the range 0:18 to make it include chr 1... weird)
+system(paste0("bcftools concat ",
+              "--output ",outPath,
+              "AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered.vcf.gz ",
+              "--output-type z --threads 10",
+              paste0(inPath,"chr",0:18,
+                     "_MergedYellowCASSGenotypes_REF19imputedFiltered.vcf.gz",
+                     collapse = " ")))
+
+
+## Convert to binary blink (bed/bim/fam)
+vcfName <- "AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered"
+system(paste0("export PATH=/programs/plink-1.9-x86_64-beta3.30:$PATH;",
+              "plink --vcf ",inPath,vcfName,".vcf.gz ",
+              "--make-bed --const-fid --keep-allele-order ",
+              "--out ",outPath,vcfName))
+
+## Check the final file:
+system(paste0("bcftools stats /workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered.vcf.gz"))
+
+# There are now 55,567 SNPs and 392 individuals
+
+# Fix sample name typo missing a leading zero
+mergedvcf <- vcfR::read.vcfR("/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered.vcf.gz")
+colnames(mergedvcf@gt)[colnames(mergedvcf@gt) == "IITA.TMS.IBA70593_A46112"] <- "IITA.TMS.IBA070593_A46112"
+
+#rewrite out corrected
+write.vcf(mergedvcf, file="/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered.vcf.gz")
+#save list of sample names
+write.table(colnames(mergedvcf@gt)[-1], col.names = F, row.names = F, 
+            file=paste0(inpath,"MergedYellowCASSGenotypes_samplenames.txt"))
+
+#Check if the duplicates are similar with bcftools gtcheck:
+#bcftools gtcheck AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered.vcf.gz > gtcompare_Merged.txt
+Disc_scores <- read.delim("/workdir/ssv42/yellowGWAS/data/genotype_data/imputation-output/gtcompare_Merged.txt", skip=23, sep="\t", header=T)
+hist(Disc_scores$X.4.Discordance)
+
+Disc_scores$accession1 <- gsub("_A.*", "",Disc_scores$X.2.Query.Sample) %>% gsub("\\.", "-", .)
+Disc_scores$accession2 <- gsub("_A.*", "",Disc_scores$X.3.Genotyped.Sample) %>% gsub("\\.", "-", .)
+#View(Disc_scores %>% filter(accession1 == accession2))
+
+#Identify duplicate accessions:
+samplenames <- read.table(paste0(inpath,"MergedYellowCASSGenotypes_samplenames.txt"))[,1]
+accessionnames <- samplenames %>% gsub("\\.", "-", .) %>% gsub("_A.*", "", .)
+dup_accessions <- which(duplicated(accessionnames, fromLast=T))
+dup_accessions_all <- c(which(duplicated(accessionnames)), which(duplicated(accessionnames, fromLast=T)))
+
+#accession pairs that look like they might not be the same (high discordance score):
+suspicious <- c("IITA.TMS.IBA210092_A45989", "IITA.TMS.IBA210092_A45862", "IITA.TMS.IBA210218_A45938", "IITA.TMS.IBA210218_A45897","IITA.TMS.IBA210222_A45924","IITA.TMS.IBA210222_A45879")
+# the others look okay
+
+#duplicates to remove:
+toremove <- c(samplenames[dup_accessions], suspicious)
+print(paste0("removing ", length(toremove), " samples"))
+
+write.table(toremove, col.names = F, row.names = F, quote=F, file=paste0(inpath,"imputation-output/CASSHPduplicates_toremove.txt"))
+
+### Subset using bcftools terminal command:
+system(paste0("cd ", inpath, "imputation-output/ ; ", "bcftools view -Ou --samples-file ^CASSHPduplicates_toremove.txt -o AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered_deduped.vcf.gz AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered.vcf.gz"))
+
+# Move to mvGWAS folder:
+system(paste0("cp ", inpath, "imputation-output/AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered_deduped.vcf.gz /workdir/ssv42/mvGWAS/data/AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered_deduped.vcf.gz"))
+
+#save corrected list of sample names
+write.table(samplenames[!samplenames %in% toremove], col.names = F, row.names = F, 
+            file=paste0(inpath,"MergedYellowCASSGenotypes_samplenames_deduped.txt"))
+```
+This outputs the file `AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered_deduped.vcf.gz` with 55602 SNPs and 380 individuals
+
+# Get haplotype matrix:
+Haplotype matrix from VCF
+
+```{r}
+#Select dataset
+dataset <- "CASS" #or #HP
+print(paste0("working with ", dataset, " data"))
+
+
+if(dataset=="CASS"){
+  VCFname <- "AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered_deduped"
+} else if(dataset=="HP"){
+  VCFname <- "AllChrom_YellowGenotypes_REF19imputedAndFiltered_noITH"
+}
+```
+
+
+```{r, eval=F}
+pathIn <-"/workdir/ssv42/mvGWAS/data/"
+pathOut <- pathIn
+vcfName <- VCFname
+system(paste0("bcftools convert --hapsample ",
+              pathOut,vcfName," ",
+              pathIn,vcfName,".vcf.gz "))
+```
+
+Read haplotypes into R
+```{r, eval=F}
+library(data.table)
+haps<-fread(paste0(pathIn,vcfName,".hap.gz"),
+            stringsAsFactors = F,header = F) %>% 
+  as.data.frame
+sampleids<-fread(paste0(pathIn,vcfName,".samples"),
+                 stringsAsFactors = F,header = F,skip = 2) %>% 
+  as.data.frame
+
+#add sample IDs
+hapids<-sampleids %>% 
+  dplyr::select(V1,V2) %>% 
+  mutate(SampleIndex=1:nrow(.)) %>% 
+  rename(HapA=V1,HapB=V2) %>% 
+  pivot_longer(cols=c(HapA,HapB),
+               names_to = "Haplo",values_to = "SampleID") %>% 
+  mutate(HapID=paste0(SampleID,"_",Haplo)) %>% 
+  arrange(SampleIndex)
+colnames(haps)<-c("Chr","HAP_ID","Pos","REF","ALT",hapids$HapID)
+
+#format, transpose, and save as matrix
+haps %<>% 
+  mutate(HAP_ID=gsub(":","_",HAP_ID)) %>% 
+  column_to_rownames(var = "HAP_ID") %>% 
+  dplyr::select(-Chr,-Pos,-REF,-ALT)
+haps %<>% t(.) %>% as.matrix(.)
+
+saveRDS(haps, file=paste0(pathOut, "haplotype_matrix_", dataset, ".rds"))
+```
+
+
+

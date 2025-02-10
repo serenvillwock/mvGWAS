@@ -1,0 +1,729 @@
+---
+title: "06_candidate_gene_analysis"
+output: html_document
+date: "2024-03-13"
+---
+
+# About
+TBD
+
+# Setup
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse); library(qqman); library(asreml); library(parallel)
+project_path <- "/workdir/ssv42/mvGWAS/"
+setwd(project_path)
+set.seed(14850)
+
+#Select dataset
+dataset <- "CASS" #"HP" #"CASS"
+```
+
+## Import list of all cassava genes from Phytozome and a priori candidate list
+# Map from v4.1 transcripts to v6.1 gene names
+# Transcript and gene names came from: Wang et al. 2014, Sreekumar et al. 2022, and Saithong et al. 2013
+```{r}
+transcript_gene_key <- read_delim(paste0(project_path, "data/Phytozome_gene_annotations/Mesculenta_305_v6.1.locus_transcript_name_map.txt"), delim="\t", skip=1, show_col_types = FALSE)
+#warning is okay: it appropriately fills in NAs where necessary
+
+gene_annotations <- read_delim(paste0(project_path, "data/Phytozome_gene_annotations/Mesculenta_305_v6.1.annotation_info.txt"), show_col_types = FALSE)
+
+gff_genes <- ape::read.gff(paste0(project_path, "data/Phytozome_gene_annotations/Mesculenta_305_v6.1.gene.gff3")) %>%
+  filter(type=="gene") %>%
+  mutate(geneID = str_match(attributes, "Name=([^;]+)")[,2]) %>%
+  dplyr::select(-c("source","score","phase"))
+
+allgenes <- read_delim(paste0(project_path, "data/Mesculenta_v6_genes.tsv"), skip = 1, delim="\t",
+                       col_names=c("gene_ID", "gene_synonym", "duplicate", "transcript_ID", "function_annot", "species", "chromosome", "start_pos", "end_pos"), show_col_types = FALSE) %>%
+  dplyr::select(-c(duplicate, species)) %>%
+  full_join(transcript_gene_key, by=c("gene_ID"="#new-locusName", "gene_synonym"="old-locusName", "transcript_ID"="new-transcriptName")) %>%
+  full_join(gff_genes, by=c("gene_ID"="geneID")) %>%
+  full_join(gene_annotations, by=c("gene_ID"="locusName", "transcript_ID"="transcriptName")) %>%
+  mutate(start_pos = case_when(is.na(start_pos) ~ start, T ~ start_pos),
+         end_pos = case_when(is.na(end_pos) ~ end, T ~ end_pos)) %>%
+  mutate(chrom = as.integer(gsub("Chromosome0", "", chromosome) %>% gsub("Chromosome", "", .)))
+
+
+
+apriori <- read.csv(paste0(project_path, "data/APrioriCandidateGenesTable.csv")) %>%
+  dplyr::select(-c(Citations, Cellular.component, Genes.with..related.TFBS)) %>%
+  mutate(transcript_to_gene = paste0(transcript.ID..Phytozome., ".g"))
+
+matchbytranscript  <- apriori %>%
+  left_join(allgenes, by=c("transcript.ID..Phytozome." = "old-transcriptName"), relationship = "many-to-many") 
+
+matchbytranscriptfuzzy  <- apriori %>%
+  left_join(allgenes, by=c("transcript_to_gene" = "gene_synonym"), relationship = "many-to-many") 
+
+matchbygeneID  <- apriori %>%
+  left_join(allgenes, by=c("Cassava.gene.name.s." = "gene_ID"), relationship = "many-to-many") %>%
+  mutate(gene_ID = Cassava.gene.name.s.)
+
+apriori_genes <- full_join(matchbytranscript, matchbygeneID) %>%
+  full_join(matchbytranscriptfuzzy) %>%
+  filter(!duplicated(gene_ID)) %>%
+  mutate(chrom = as.integer(gsub("Chromosome", "", chromosome))) %>%
+  filter(!is.na(chromosome))
+```
+(Warnings here about NA generation & parsing failures is OK.)
+
+
+# Read in SNP hit data from bivariate analyses:
+```{r}
+all_SNP_results_df <- readRDS(file=paste0(project_path,
+             "output/MVresults_sorted_PSY2KASP_5PCs.RDS"))
+
+all_SNP_results_peaks <- readRDS(file=paste0(project_path, "output/all_SNP_results_MVWald_wPSY2KASPand5PC2_annotations_effdir_0826_1310.RDS"))
+
+```
+
+
+# Check if any a priori candidate genes were hit
+```{r}
+# all_SNP_results_peaks <- readRDS(file=paste0(project_path, "output/all_SNP_results_MVWald_noPCs_wpeak_annotations_effdir_0614_1512.RDS")) %>% 
+#   filter(peak1_SNP %in% c("S1_24309741", "S10_2262535") | peak2_SNP == "S1_26700297") 
+Bonferonni_passed_SNPs <- all_SNP_results_peaks_highLD %>% filter(P < Gao.cutoff)
+
+
+all_SNP_results_peaks_highLD <- all_SNP_results_peaks %>%
+  filter(peak1_SNP %in% Bonferonni_passed_SNPs$SNP) %>%
+  filter(Rsquared_any > 0.75) 
+  #filter(peak1_SNP %in% c("S1_26700297", "S10_2262535")) %>% #selecting just bonferroni threshold passed SNPs
+
+dist_threshold <- 100000
+threshold_chrom1 <- 375000
+threshold_chrom4 <- 500000
+
+apriorigene_hits <- data.frame()
+for(i in 1:nrow(apriori_genes)){
+  
+  if(apriori_genes$chromosome[i] == "Chromosome01"){dist_threshold <- threshold_chrom1}
+  if(apriori_genes$chromosome[i] == "Chromosome04"){dist_threshold <- threshold_chrom4}
+  
+  start_search <- apriori_genes$start_pos[i] - dist_threshold
+  end_search <- apriori_genes$end_pos[i] + dist_threshold
+  chrom_i <- apriori_genes$chrom[i]
+  
+  lookup <- all_SNP_results_peaks_highLD %>% 
+    filter(CHROM == chrom_i & POS > start_search & POS < end_search) %>%
+    arrange(-LDpeak1)
+  
+  if(nrow(lookup) != 0) {
+    this_hit <- c(apriori_genes$Description[i], apriori_genes$chromosome[i],
+                  apriori_genes$start_pos[i], apriori_genes$end_pos[i], 
+                  lookup$LDpeak1[1], lookup$peak1_SNP[1], lookup$P[1])
+    
+    apriorigene_hits <- rbind(apriorigene_hits, this_hit)
+    }
+}
+colnames(apriorigene_hits) <- c("gene", "chromosome", "start_pos", "end_pos", "LDwpeakSNP", "peakSNP")
+
+
+print(apriorigene_hits)
+```
+
+# Get set of candidate genes near top SNPs using 
+
+Method using SNP-specific distance threshold:
+```{r}
+candidate_genes <- data.frame()
+for(i in 1:nrow(Bonferonni_passed_SNPs)){ #search genes
+  
+  chrom_i <- Bonferonni_passed_SNPs$CHROM[i]
+  pos_i <- Bonferonni_passed_SNPs$POS[i]
+  snp_i <- Bonferonni_passed_SNPs$SNP[i]
+  
+  #Find LD decay interval for this SNP
+  genomat_around_peaki <- genomat_ROG %>% filter(CHROM == chrom_i & POS > pos_i - 500000 & POS < pos_i + 500000) %>%
+    mutate(distance_peaki = abs(POS - pos_i))
+  rownames(genomat_around_peaki) <- genomat_around_peaki$SNP
+
+  LDmatrix_around_peaki <- genomat_around_peaki %>% dplyr::select(-c(SNP, ALT, REF, compute_group, CHROM, POS, distance_peaki)) %>% 
+        t() %>% cor()
+  
+      R2withpeaki <- (LDmatrix_around_peaki[,paste0(snp_i)])^2
+      genomat_around_peaki$R2peaki <- R2withpeaki
+      
+      
+      ggplot(genomat_around_peaki, aes(x=distance_peaki, y=R2peaki)) + geom_point() + xlim(c(0,100000))
+      
+  
+  
+  
+  allgenes_chrom_i <- allgenes %>% filter(chrom == chrom_i)
+  for(j in 1:nrow(allgenes_chrom_i)){
+    
+    start_search <- allgenes_chrom_i$start_pos[j] - dist_threshold
+    end_search <- allgenes_chrom_i$end_pos[j] + dist_threshold
+    
+    if( pos_i >= start_search && pos_i <= end_search){
+      
+      gene_midpoint = (as.numeric(allgenes_chrom_i$start_pos[j]) + as.numeric(allgenes_chrom_i$end_pos[j]))/2
+    
+      this_candidate <- c(as.character(Bonferonni_passed_SNPs$SNP[i]),
+                          allgenes_chrom_i$gene_ID[j],
+                          allgenes_chrom_i$function_annot[j],
+                          allgenes_chrom_i$GO[j],
+                          allgenes_chrom_i$chrom[j],
+                          allgenes_chrom_i$start_pos[j],
+                          allgenes_chrom_i$end_pos[j],
+                          abs(as.numeric(gsub("S1.*_", "", 
+                                              as.character(Bonferonni_passed_SNPs$SNP[i]) )) - gene_midpoint))
+      
+      candidate_genes <- rbind(candidate_genes, this_candidate)
+      
+    }
+  } 
+}
+colnames(candidate_genes) <- c("SNP", "gene_ID", "functional_annotation", "GOterm", "chrom", "startpos", "endpos", "mid_distance")
+View(unique(candidate_genes))
+```
+
+
+
+Newer method using chromosome-specific distance threshold:
+```{r}
+dist_threshold <- 100000
+threshold_chrom1 <- 100000 #375000
+threshold_chrom4 <- 100000 #500000
+
+candidate_genes <- data.frame()
+for(i in 1:nrow(Bonferonni_passed_SNPs)){ #search genes
+  
+  chrom_i <- Bonferonni_passed_SNPs$CHROM[i]
+  pos_i <- Bonferonni_passed_SNPs$POS[i]
+  
+  if(chrom_i == 1){
+    dist_threshold <- threshold_chrom1} 
+  if(chrom_i == 4){ 
+    dist_threshold <- threshold_chrom4}
+  
+  allgenes_chrom_i <- allgenes %>% filter(chrom == chrom_i)
+  for(j in 1:nrow(allgenes_chrom_i)){
+    
+    start_search <- allgenes_chrom_i$start_pos[j] - dist_threshold
+    end_search <- allgenes_chrom_i$end_pos[j] + dist_threshold
+    
+    if( pos_i >= start_search && pos_i <= end_search){
+      
+      gene_midpoint = (as.numeric(allgenes_chrom_i$start_pos[j]) + as.numeric(allgenes_chrom_i$end_pos[j]))/2
+    
+      this_candidate <- c(as.character(Bonferonni_passed_SNPs$SNP[i]),
+                          allgenes_chrom_i$gene_ID[j],
+                          allgenes_chrom_i$function_annot[j],
+                          allgenes_chrom_i$`arabi-defline`[j],
+                          allgenes_chrom_i$GO[j],
+                          allgenes_chrom_i$chrom[j],
+                          allgenes_chrom_i$start_pos[j],
+                          allgenes_chrom_i$end_pos[j],
+                          abs(as.numeric(gsub("S1.*_", "", 
+                                              as.character(Bonferonni_passed_SNPs$SNP[i]) )) - gene_midpoint))
+      
+      candidate_genes <- rbind(candidate_genes, this_candidate)
+      
+    }
+  } 
+}
+colnames(candidate_genes) <- c("SNP", "gene_ID", "functional_annotation", "arabidopsis_annot", "GOterm", "chrom", "startpos", "endpos", "mid_distance")
+View(unique(candidate_genes))
+
+write.csv(unique(candidate_genes), file=paste0(project_path, "output/bivariate_candidate_genes_100kb.csv"))
+```
+
+
+
+Old method with LD and distance-based cutoff:
+```{r}
+allgenes$chrom <- gsub("Chromosome", "", allgenes$chromosome) %>% as.numeric()
+
+all_SNP_results_peaks_highLD_nearpeak <- all_SNP_results_peaks_highLD %>% 
+  filter(abs(distance_any) < 100000) #look near SNPs in high LD (> 0.75 of peak) and within 100kb of peak SNP
+
+candidate_genes <- data.frame()
+for(i in 1:nrow(all_SNP_results_peaks_highLD_nearpeak)){ #search genes
+  
+  chrom_i <- all_SNP_results_peaks_highLD_nearpeak$CHROM[i]
+  pos_i <- all_SNP_results_peaks_highLD_nearpeak$POS[i]
+  
+  allgenes_chrom_i <- allgenes %>% filter(chrom == chrom_i)
+  for(j in 1:nrow(allgenes_chrom_i)){
+    
+    start_search <- allgenes_chrom_i$start_pos[j] - 100000
+    end_search <- allgenes_chrom_i$end_pos[j] + 100000
+    
+    if( pos_i >= start_search && pos_i <= end_search){
+    
+      this_candidate <- c(as.character(all_SNP_results_peaks_highLD_nearpeak$SNP[i]),
+                          allgenes_chrom_i$function_annot[j],
+                          allgenes_chrom_i$chrom[j],
+                          allgenes_chrom_i$start_pos[j],
+                          allgenes_chrom_i$end_pos[j],
+                   all_SNP_results_peaks_highLD_nearpeak$Rsquared_any[i], 
+                   all_SNP_results_peaks_highLD_nearpeak$distance_any[i],
+                   all_SNP_results_peaks_highLD_nearpeak$peak1_SNP[i],
+                   all_SNP_results_peaks_highLD_nearpeak$peak2_SNP[i])
+      
+      candidate_genes <- rbind(candidate_genes, this_candidate)
+      
+    }
+  } 
+}
+
+colnames(candidate_genes) <- c("SNPneargene", "gene_annot", "chromosome", "startpos", "endpos", "Rsquared_peakSNP", "distance_peakSNP", "peak1_SNP","peak2_SNP")
+
+candidate_genes_unique <- candidate_genes %>% unique() %>% group_by(gene_annot) %>% slice(which.max(Rsquared_peakSNP)) %>%
+  mutate(start_pos = as.numeric(startpos), end_pos=as.numeric(endpos))
+
+candidate_genes_table <- candidate_genes_unique %>% 
+  left_join((allgenes %>% dplyr::select(gene_ID, function_annot, start_pos) %>% unique()), by=c("gene_annot"= "function_annot", "start_pos"="start_pos")) %>%
+  arrange(SNPneargene) %>%
+  mutate(midpoint = (as.numeric(start_pos) + as.numeric(end_pos))/2) %>% 
+  mutate(distance_midpoint = abs(as.numeric(gsub("S1.*_", "", peak1_SNP)) - midpoint))
+
+View(candidate_genes_table)
+
+```
+
+
+
+
+
+#### Univariate associations candidate gene analysis: ####
+
+
+
+Read in and compile significant SNPs from univariate associations
+```{r}
+# Set significance cut-off
+alpha <- 0.05
+#Gao modified Bonferroni
+Meff_chrom <- readRDS(file="./output/Meff_perchrom_estimates_CASS.RDS")
+Meff <- sum(Meff_chrom)
+Gao.cutoff <- alpha/Meff
+
+TCICHK_hits <- readRDS(file=paste0(project_path,
+             "output/univariate_models/TCICHK_all_SNP_results_df_0717.RDS")) %>%
+  #filter(as.numeric(Pr) <= Gao.cutoff) %>%
+  arrange(as.numeric(Pr)) %>%
+  mutate(trait = "TCICHK")
+
+TCHART_hits <- readRDS(file=paste0(project_path,
+             "output/univariate_models/TCHART_all_SNP_results_df_0717.RDS")) %>%
+  #filter(as.numeric(Pr) <= Gao.cutoff) %>%
+  arrange(as.numeric(Pr))%>%
+  mutate(trait = "TCHART")
+
+DM_hits <- readRDS(file=paste0(project_path,
+             "output/univariate_models/DM_all_SNP_results_df_0717.RDS")) %>%
+  #filter(as.numeric(Pr) <= Gao.cutoff) %>%
+  arrange(as.numeric(Pr))%>%
+  mutate(trait = "DM")
+
+RTWT_hits <- readRDS(file=paste0(project_path,
+             "output/univariate_models/RTWT_all_SNP_results_df_0910.RDS")) %>%
+  #filter(as.numeric(Pr) <= Gao.cutoff) %>%
+  arrange(as.numeric(Pr))%>%
+  mutate(trait = "RTWT")
+
+HI_hits <- readRDS(file=paste0(project_path,
+             "output/univariate_models/HI_all_SNP_results_df_0910.RDS")) %>%
+  #filter(as.numeric(Pr) <= Gao.cutoff) %>%
+  arrange(as.numeric(Pr))%>%
+  mutate(trait = "HI")
+
+SPRTPERC_hits <- readRDS(file=paste0(project_path,
+             "output/univariate_models/SPRTPERC_all_SNP_results_df_0911.RDS")) %>%
+  #filter(as.numeric(Pr) <= Gao.cutoff) %>%
+  arrange(as.numeric(Pr))%>%
+  mutate(trait = "SPRTPERC")
+
+FRYLD_hits <- readRDS(file=paste0(project_path,
+             "output/univariate_models/FRYLD_all_SNP_results_df_0911.RDS")) %>%
+  #filter(as.numeric(Pr) <= Gao.cutoff) %>%
+  arrange(as.numeric(Pr))%>%
+  mutate(trait = "FRYLD")
+
+CMD3S_hits <- readRDS(file=paste0(project_path,
+             "output/univariate_models/CMD3S_all_SNP_results_df_0912.RDS")) %>%
+  #filter(as.numeric(Pr) <= Gao.cutoff) %>%
+  arrange(as.numeric(Pr))%>%
+  mutate(trait = "CMD3S")
+
+CMD3I_hits <- readRDS(file=paste0(project_path,
+             "output/univariate_models/CMD3I_all_SNP_results_df_0912.RDS")) %>%
+  #filter(as.numeric(Pr) <= Gao.cutoff) %>%
+  arrange(as.numeric(Pr))%>%
+  mutate(trait = "CMD3I")
+
+
+
+all_uni_results <- rbind(TCICHK_hits, TCHART_hits, DM_hits, RTWT_hits, HI_hits, 
+                         SPRTPERC_hits, FRYLD_hits, CMD3S_hits, CMD3I_hits) %>%
+  mutate(POS = as.numeric(POS))
+
+all_uni_hits <- all_uni_results %>% filter(as.numeric(Pr) <= Gao.cutoff)
+```
+
+
+Identify peak SNP in each QTL
+```{r}
+# genomat_ROG <- readRDS(file=paste0(project_path, "data/genomat_restofgenome_CASS.RDS")) %>%
+#   mutate(CHROM= as.integer(gsub("S", "", SNP) %>% gsub("_[0-9].*", "", .)),
+#          POS= as.numeric(gsub("^S.*_", "", SNP)))
+
+traitlist <- unique(all_uni_hits$trait)
+
+alltraits_peaks <- data.frame()
+for(j in seq_along(traitlist)){
+  
+  traitj <- traitlist[j]
+  print(traitj)
+  traitj_uni_hits <- all_uni_hits %>% filter(trait == traitj)
+
+  chroms_to_seq <- unique(traitj_uni_hits$CHROM)
+  
+  #go through each chromosome that has sig SNPs
+  
+  traitj_peaks_allchrom <- data.frame()
+  for(i in seq_along(chroms_to_seq)) {
+    print(chroms_to_seq[i])
+    
+    #Identify top SNP on chromosome i 
+    topSNPs_chri <- traitj_uni_hits %>% filter(CHROM == chroms_to_seq[i]) %>% arrange(as.numeric(Pr))
+    peak1 <- topSNPs_chri[1,]
+    print(peak1$SNP_ID)
+    
+    #check if there is another peak on this chromosome (> 500kb away and not in high LD) 
+    peak1_region <- c( peak1$POS - 500000 , peak1$POS + 500000 )  
+   
+    otherpeaks <- topSNPs_chri %>% filter(POS < peak1_region[1] | POS > peak1_region[2])
+    
+    if( nrow(otherpeaks) != 0){ #check for LD with peak 1
+    
+    genomat_peaks_i <- genomat_ROG %>% filter(SNP %in% c(peak1$SNP_ID, otherpeaks$SNP_ID)) 
+    rownames(genomat_peaks_i) <- genomat_peaks_i$SNP
+    
+    LDmatrix_peaks <- genomat_peaks_i %>%
+      dplyr::select(-c(SNP, ALT, REF, compute_group, CHROM, POS)) %>% #drop metadata non-numeric columns
+      t() %>% cor() #calculate correlation matrix
+    
+    R2withpeak1 <- (LDmatrix_peaks[,paste0(peak1$SNP_ID)])^2 #R2 with peak1 SNP
+    
+    sigSNPsnotinLDwpeak1 <- R2withpeak1[R2withpeak1 <= 0.05]
+    
+    peak2 <- otherpeaks %>% filter(SNP_ID %in% names(sigSNPsnotinLDwpeak1)) %>%
+      arrange(as.numeric(Pr)) %>% head(n=1)
+
+    if(nrow(peak2) != 0){
+    allchromi_peaks  <- rbind(peak1, peak2)
+    } } #end checking for other peaks
+    else{ allchromi_peaks <- peak1}
+    
+  #join chromosome_i results with the others
+  traitj_peaks_allchrom <- rbind(traitj_peaks_allchrom, allchromi_peaks)
+    
+  } #end chromosome
+    
+  #join trait_j results with the others
+  alltraits_peaks <- rbind(alltraits_peaks, traitj_peaks_allchrom)
+  
+} #end trait
+
+saveRDS(alltraits_peaks, file="/workdir/ssv42/mvGWAS/output/univariate_models/alltraits_peakSNPs.RDS")
+
+#Save for supplementary table 2
+#get SNP REF/ALT data:
+genomat_uni_peakSNPs <- genomat_ROG %>% filter(SNP %in% alltraits_peaks$SNP_ID) %>%
+  mutate(AF = rowSum)
+
+#calculate AF:
+justgenos <- genomat_uni_peakSNPs[,c(4:381)]
+AFfunction <- function(x){sum(x)/(ncol(justgenos)*2)}
+AFs <- apply(justgenos, MARGIN = 1, FUN = AFfunction)
+genomat_uni_peakSNPs$AF <- AFs
+
+
+alltraits_peaks_stats <- left_join(alltraits_peaks, 
+                                   genomat_uni_peakSNPs %>% dplyr::select(SNP, REF, ALT, AF), 
+                                   by=c("SNP_ID" = "SNP")) 
+
+write.csv(alltraits_peaks_stats, file="/workdir/ssv42/mvGWAS/output/univariate_models/peakSNP_summarystats_TableS2.csv")
+
+```
+
+
+
+
+Identify candidate genes within specified range of any significantly associated SNPs:
+```{r}
+#Filter for unique QTL
+search_window_bp <- 100000
+
+candidate_genes <- data.frame()
+for(i in 1:nrow(all_uni_hits)){ #iterate across all significant SNPs (not filtered for LD/duplicates)
+  print(i)
+  chrom_i <- all_uni_hits$CHROM[i]
+  pos_i <- as.numeric(all_uni_hits$POS[i])
+  
+  allgenes_nearby <- allgenes %>% filter(chrom == chrom_i &
+                                           start_pos > pos_i - search_window_bp &
+                                           end_pos < pos_i + search_window_bp )
+  
+  if(nrow(allgenes_nearby != 0)){
+  candidate_genes_i <- cbind(all_uni_hits[i,], allgenes_nearby)
+  
+  candidate_genes <- rbind(candidate_genes, candidate_genes_i)
+  }
+  
+}
+
+#filter for unique gene/trait combinations 
+candidate_genes_unique <- candidate_genes %>% unique() %>% group_by(gene_ID, trait) %>%
+  slice(which.min(Pr)) 
+
+
+
+View(candidate_genes_unique)
+
+
+# candidate_genes_table <- candidate_genes_unique %>% 
+#   left_join((allgenes %>% dplyr::select(gene_ID, function_annot, start_pos) %>% unique()), by=c("gene_annot"= "function_annot", "start_pos"="start_pos")) %>%
+#   arrange(SNPneargene) %>%
+#   mutate(midpoint = (as.numeric(start_pos) + as.numeric(end_pos))/2) %>% 
+#   mutate(distance_midpoint = abs(as.numeric(gsub("S1.*_", "", peak1_SNP)) - midpoint))
+# 
+# View(candidate_genes_table)
+```
+
+
+Add in distance of candidate genes to peak SNPs
+```{r}
+all_candidate_genes_peaks <- data.frame()
+
+for(i in 1:nrow(alltraits_peaks)){
+  
+  peakSNPi <- alltraits_peaks[i, ]
+  
+  peakSNPi_candgenes <- candidate_genes_unique %>% filter(trait == peakSNPi$trait, CHROM == peakSNPi$CHROM) %>%
+    mutate(distance_peakSNPi = case_when( peakSNPi$POS > start_pos & peakSNPi$POS < end_pos ~ 0, #make distance 0 if the SNP is in the gene
+                                          #otherwise take abs distance to midpoint of gene
+                                          T ~  abs((start_pos + end_pos)/2 - peakSNPi$POS) )) %>%  
+    filter(distance_peakSNPi < 100000) %>%
+    mutate(peakSNP = peakSNPi$SNP_ID) %>%
+    dplyr::select(trait:peakSNP) %>%
+    left_join(., peakSNPi)
+
+  
+  all_candidate_genes_peaks <- rbind(all_candidate_genes_peaks, peakSNPi_candgenes)
+}
+
+View(unique(all_candidate_genes_peaks))
+
+saveRDS(unique(all_candidate_genes_peaks), file="/workdir/ssv42/mvGWAS/output/univariate_models/univariate_candidate_genes.RDS")
+
+write.csv(unique(all_candidate_genes_peaks), file="/workdir/ssv42/mvGWAS/output/univariate_models/univariate_candidate_genes.csv")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+OLD WAY
+
+Flag peaks and calculate LD:
+```{r}
+#flag peaks and calculate LD 
+topSNPs <- all_uni_hits
+
+# genomat_ROG <- readRDS(file=paste0(project_path, "data/genomat_restofgenome_CASS.RDS")) %>%
+#   mutate(CHROM= as.integer(gsub("S", "", SNP) %>% gsub("_[0-9].*", "", .)),
+#          POS= as.numeric(gsub("^S.*_", "", SNP)))
+
+traitlist <- unique(all_uni_hits$trait)
+
+alltraits_peaks <- data.frame()
+genomat_peaks_allchrom <- data.frame()
+alltrait_highLD_peakSNPs <- data.frame()
+
+for(j in seq_along(traitlist)){ #iterate through the traits
+  print(traitlist[j])
+  
+  for(i in 1:18) { #iterate through the chromosomes
+    print(i)
+    genomat_peaks_i <- genomat_ROG %>% filter(CHROM == i)
+    rownames(genomat_peaks_i) <- genomat_peaks_i$SNP
+    
+    topSNPs_chri <- topSNPs %>% filter(CHROM == i) %>% arrange(as.numeric(Pr))
+    peak1 <- topSNPs_chri[1,]
+  
+    #calculate LD between each SNP and the peak 1 SNP
+    if(nrow(peak1) != 0 & !is.na(peak1$SNP_ID)){
+      LDmatrix_peak1 <- genomat_peaks_i %>% dplyr::select(-c(SNP, ALT, REF, compute_group, CHROM, POS)) %>% #drop metadata non-numeric columns
+        t() %>% cor() #calculate correlation matrix
+      R2withpeak1 <- (LDmatrix_peak1[,paste0(peak1$SNP_ID)])^2 #pull out correlation with peak1 SNP
+      genomat_peaks_i$R2peak1 <- R2withpeak1
+      
+      genomat_peaks_i <- genomat_peaks_i %>% mutate(distance_peak1 = POS - peak1$POS, peak1_SNP = peak1$SNP_ID)
+    } else{genomat_peaks_i <- genomat_peaks_i %>% mutate(R2peak1 = NA, distance_peak1 = NA, peak1_SNP = NA)}
+  
+    #check if there is another peak on this chromosome and repeat if so
+    peak1_region <- c( peak1$POS - 2000000 , peak1$POS + 2000000)  
+    genomat_around_peak1 <- genomat_peaks_i %>% 
+         filter(POS > peak1_region[1] & POS < peak1_region[2])
+    
+    otherpeaks <- topSNPs_chri[!topSNPs_chri$SNP_ID %in% genomat_around_peak1$SNP,]
+    peak2 <- otherpeaks %>% arrange(as.numeric(Pr)) %>% head(n=1)
+    
+    #calculate LD between each SNP and the peak 2 SNP
+    if(nrow(peak2) != 0){
+      LDmatrix_peak2 <- genomat_peaks_i %>% dplyr::select(-c(SNP, ALT, REF, compute_group, CHROM, POS, distance_peak1, peak1_SNP)) %>% 
+        t() %>% cor()
+      R2withpeak2 <- (LDmatrix_peak2[,paste0(peak2$SNP_ID)])^2
+      genomat_peaks_i$R2peak2 <- R2withpeak2
+      
+      genomat_peaks_i <- genomat_peaks_i %>% mutate(distance_peak2 = POS - peak2$POS, peak2_SNP = peak2$SNP_ID)
+    } else{genomat_peaks_i <- genomat_peaks_i %>% mutate(R2peak2 = NA, distance_peak2 = NA, peak2_SNP = NA)
+    }
+    
+    #join chromosome results with the others
+   genomat_peaks_allchrom <- rbind(genomat_peaks_allchrom, genomat_peaks_i)
+   
+  } #end chromosome
+  
+  traitj_highLD_SNPs <- genomat_peaks_allchrom %>% filter(R2peak1 > 0.75 | R2peak2 > 0.75) %>%
+    mutate(trait = traitlist[j])
+  
+  alltrait_highLD_peakSNPs <- rbind(alltrait_highLD_peakSNPs, traitj_highLD_SNPs)
+  
+}#end trait
+
+
+```
+
+
+
+# Get set of candidate genes near top SNPs from univariate associations:
+```{r}
+#look near SNPs in high LD (> 0.75 of peak) and within 500kb of peak SNP
+alltrait_highLD_near_peakSNPs <- alltrait_highLD_peakSNPs %>% 
+  filter(abs(distance_peak1 | distance_peak2) < 500000) 
+
+candidate_genes <- data.frame()
+for(i in 1:nrow(alltrait_highLD_near_peakSNPs)){ 
+  
+  #for each SNP near  genes
+  
+  chrom_i <- alltrait_highLD_near_peakSNPs$CHROM[i]
+  pos_i <- alltrait_highLD_near_peakSNPs$POS[i]
+  
+  allgenes_chrom_i <- allgenes %>% filter(chrom == chrom_i)
+  for(j in 1:nrow(allgenes_chrom_i)){
+    
+    start_search <- allgenes_chrom_i$start_pos[j] - 5000
+    end_search <- allgenes_chrom_i$end_pos[j] + 5000
+    
+    if( pos_i >= start_search && pos_i <= end_search){
+    
+      this_candidate <- c(as.character(alltrait_highLD_near_peakSNPs$SNP[i]),
+                          allgenes_chrom_i$function_annot[j],
+                          allgenes_chrom_i$chrom[j],
+                          allgenes_chrom_i$start_pos[j],
+                          allgenes_chrom_i$end_pos[j],
+                          
+                          alltrait_highLD_near_peakSNPs$trait[i],
+                          
+                   alltrait_highLD_near_peakSNPs$peak1_SNP[i],
+                   alltrait_highLD_near_peakSNPs$R2peak1[i],
+                   alltrait_highLD_near_peakSNPs$distance_peak1[i],
+                   
+                   alltrait_highLD_near_peakSNPs$peak2_SNP[i],
+                   alltrait_highLD_near_peakSNPs$R2peak2[i],
+                   alltrait_highLD_near_peakSNPs$distance_peak2[i])
+      
+      candidate_genes <- rbind(candidate_genes, this_candidate)
+      
+    }
+  } 
+}
+
+colnames(candidate_genes) <- c("SNPneargene", "gene_annot", "chromosome", "startpos", "endpos", "trait",
+                               "peak1_SNP", "R2peak1", "distance_peak1", 
+                               "peak2_SNP", "R2peak2", "distance_peak2")
+
+candidate_genes_unique <- candidate_genes %>% unique() %>% group_by(gene_annot) %>%
+  slice(which.max(max(c(R2peak1, R2peak2))))  %>%
+  mutate(start_pos = as.numeric(startpos), end_pos=as.numeric(endpos))
+
+candidate_genes_table <- candidate_genes_unique %>% 
+  left_join((allgenes %>% dplyr::select(gene_ID, function_annot, start_pos) %>% unique()), by=c("gene_annot"= "function_annot", "start_pos"="start_pos")) %>%
+  arrange(SNPneargene) %>%
+  mutate(midpoint = (as.numeric(start_pos) + as.numeric(end_pos))/2) %>% 
+  mutate(distance_midpoint = abs(as.numeric(gsub("S1.*_", "", peak1_SNP)) - midpoint))
+
+View(candidate_genes_table)
+
+```
+
+
+Identify candidate genes from univariate associations:
+```{r}
+#Filter for unique QTL
+
+search_window_bp <- 100000
+
+candidate_genes <- data.frame()
+for(i in 1:nrow(alltraits_peaks)){ #iterate across all significant SNPs (not filtered for LD/duplicates yet)
+  print(i)
+  chrom_i <- alltraits_peaks$CHROM[i]
+  pos_i <- as.numeric(alltraits_peaks$POS[i])
+  
+  allgenes_nearby <- allgenes %>% filter(chrom == chrom_i &
+                                           start_pos > pos_i - search_window_bp &
+                                           end_pos < pos_i + search_window_bp )
+  if(nrow(allgenes_nearby != 0)){
+  candidate_genes_i <- cbind(alltraits_peaks[i,], allgenes_nearby)
+  
+  candidate_genes <- rbind(candidate_genes, candidate_genes_i)
+  }
+  
+}
+
+#filter for unique gene/trait combinations 
+
+candidate_genes_unique <- candidate_genes %>% unique() %>% group_by(gene_ID, trait) %>%
+  slice(which.min(Pr)) 
+
+View(candidate_genes_unique)
+
+
+# candidate_genes_table <- candidate_genes_unique %>% 
+#   left_join((allgenes %>% dplyr::select(gene_ID, function_annot, start_pos) %>% unique()), by=c("gene_annot"= "function_annot", "start_pos"="start_pos")) %>%
+#   arrange(SNPneargene) %>%
+#   mutate(midpoint = (as.numeric(start_pos) + as.numeric(end_pos))/2) %>% 
+#   mutate(distance_midpoint = abs(as.numeric(gsub("S1.*_", "", peak1_SNP)) - midpoint))
+# 
+# View(candidate_genes_table)
+```
+
+
+
+
+
+
+
+
+
+Old way:
+
+
+
+
+
+
