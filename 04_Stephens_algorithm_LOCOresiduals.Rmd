@@ -4,16 +4,13 @@ output: html_document
 date: "2024-02-08"
 ---
 
----
-title: "04_run_Stephens2013"
-output: html_document
-date: "2023-11-08"
----
-
 # About
 Run GWAS with Stephens 2013 Bayesian framework.
   - Inputs: Imputed and filtered genotype file
   - Outputs: BF results table
+  
+Note: this analysis was not included in the manuscript.
+Since no random covariates could be fit using the algorithm, we tried to account for population structure by fitting regression models with the genotype random effect, leaving out one chromosome at a time, and extracting the residuals to use as phenotypes in the GWAS. However, the results were very inconsistent with our linear modeling methods so we ultimately did not trust the results. We ended up using a similar, but frequentist approach of model comparison by testing the conditional independence of the SNP on one trait given the other as a covariate in a linear model, and vice versa.
 
 # Setup
 ```{r, echo=FALSE, message=FALSE, warning=FALSE}

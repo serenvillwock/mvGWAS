@@ -8,6 +8,10 @@ date: "2024-03-20"
 # About
 Run univariate trait associations using mixed linear models in asreml.
 
+- Inputs: genotype matrix `/data/genomat_restofgenome_CASS.RDS`; imputed PSY2 KASP marker `data/genomat_plusKASP_filtered.RDS`; genomic relationship matrix `data/Ginverse_ROG_sparse_CASS.RDS`; phenotype matrix `data/BLUPs_scaled_and_hap_data_CASS.RDS`; accession names `data/CASS_accessionnames.txt`; principal components `data/DosageMatrix_PCA_CASS_PCmatrix.RDS`
+
+- Outputs: univariate association results `output/univariate_models/*_all_SNP_results_df_*.RDS")`; Univariate Manhattan plots for all traits e.g. `figures/TCICHK_GWAS_wPSY2KASPand5PCs_*.jpg`; QQ plots for all traits e.g. `figures/TCICHK_QQplot_wPSY2KASPand5PCs_CASS_*.png`
+
 # Setup
 ```{r, echo=FALSE, message=FALSE, warning=FALSE}
 library(tidyverse); library(qqman); library(asreml); library(parallel) 

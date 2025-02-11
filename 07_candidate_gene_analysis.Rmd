@@ -5,7 +5,9 @@ date: "2024-03-13"
 ---
 
 # About
-TBD
+Extract list of gene annotations with 100kb of the peak SNPs in bivariate and univariate analyses.
+
+- Inputs: gene annotation data from Phytozome `Mesculenta_305_v6.1.locus_transcript_name_map.txt`, `Mesculenta_305_v6.1.annotation_info.txt`, `Mesculenta_305_v6.1.gene.gff3`; a-priori candidate gene list `data/APrioriCandidateGenesTable.csv`
 
 # Setup
 ```{r, echo=FALSE, message=FALSE, warning=FALSE}

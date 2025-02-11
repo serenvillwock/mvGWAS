@@ -4,7 +4,13 @@ output: html_document
 date: "2025-01-22"
 ---
 
-Re-try the multivariate GEMMA GWAS with the PSY2 KASP marker as a covariate to see if the results are similar to the asreml approach.
+Re-try the multivariate GEMMA GWAS with the imputed PSY2 KASP marker as a covariate to see whether the results are similar to the asreml approach. Also run trivariate associations for TCICHK, TCHART, and DM using GEMMA.
+
+Note: this analysis not included in the final manuscript. The results were very similar (which is good) but the estimates of genetic covariance could not be extracted for each association model. Also the estimates of genetic covariance for the null model were confusingly small although seemed to be proportional.
+
+- Outputs: bivariate TCICHK/DM association results
+`output/GEMMA_TC_DM_5PCs_PSY2KASP_CASS_012325.*.txt`; trivariate TCICHK/TCHART/DM results `output/GEMMA_trivar_TCICHK_TCHART_DM_5PCs_Scaled_CASS_012325.*.txt`; univariate results: `output/GEMMA_TCICHK_5PCs_Scaled_CASS_012325.*.txt`, `output/GEMMA_DM_5PCs_Scaled_CASS_012325.*.txt`, `output/GEMMA_TCHART_5PCs_Scaled_CASS_012325.*.txt`; Manhattan plots: `figures/GEMMA_TCDMmanhattan_5PCs_Scaled_CASS_pwald_*.jpg`, `figures/GEMMA_TrivarMmanhattan_5PCs_Scaled_CASS_pwald_*.jpg`
+
 
 Load libraries
 ```{r}

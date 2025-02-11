@@ -1,0 +1,165 @@
+---
+title: "03_matrix_formatting_prep"
+output: html_document
+date: "2024-02-08"
+---
+
+# About
+Generate matrices formatted for multi-trait associations using established programs mvGEMMA (Zhou and Stephens 2014) and mvBIMBAM (Stephens 2013)
+  - Inputs: Imputed and filtered genotype file, `data/AllChrom_YellowGenotypes_REF19imputedAndFiltered.vcf.gz`; deregressed BLUPs `data/alltrait_drgBLUPs.RDS`; principal components `data/DosageMatrix_PCA_CASS.RDS`
+  - Outputs: Matrices in 'bimbam' fromat for compatability with programs. Genotype matrix: `data/GenotypeMatrix_CASS.bimbam`; Phenotype matrix: `data/BLUPmatrix_scaled_CASS.txt`; Principal component covariates matrix: `data/Covariates_5PCs_Chr1Haps_CASS.txt`
+
+# Setup
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse); library(qqman)
+project_path <- "/workdir/ssv42/mvGWAS/"
+setwd(project_path)
+set.seed(14850)
+
+# Set the PATH so we can access bcftools and other software from Rstudio
+Sys.setenv(PATH = "/usr/share/Modules/bin:/programs/docker/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/usr/Arcconf:/programs/bin:/programs/bin/mummer:/programs/bin/util:/programs/bin/bowtie:/programs/bin/bwa:/programs/bin/cufflinks:/programs/bin/tophat:/programs/bin/fastx:/programs/bin/blast:/programs/bin/blat:/programs/bin/perlscripts:/programs/bin/labutils:/programs/bin/gnuplot:/programs/bin/seqclean:/programs/bin/blast+:/programs/bin/sra:/programs/bin/bedtools/bin:/programs/bin/plink:/programs/bin/fastqc:/programs/bin/bowtie2:/programs/bin/clustalw:/programs/bin/rsem:/programs/bin/vcftools:/programs/RepeatMasker:/programs/bin/exonerate/bin:/programs/augustus/bin:/programs/bin/structure:/programs/bin/irods:/programs/bin/bedops:/programs/iv/x86_64/bin:/usr/lib64/openmpi/bin:/programs/texlive/bin/x86_64-linux:/programs/R-4.0.5-r9/bin:/programs/samtools-1.18/bin:/programs/bcftools-1.18/bin:/programs/htslib-1.18/bin:/home/ssv42/.local/bin:/home/ssv42/bin:/usr/Arcconf")
+```
+
+Select which dataset to work with:
+```{r}
+#Select dataset
+dataset <- "CASS" #"HP"
+TCtrait <- "TCICHK"
+filter_trial_byH2 <- "FALSE"
+print(paste0("working with ", dataset, " data"))
+
+
+if(dataset=="CASS"){
+  VCFname <- "AllChrom_MergedYellowCASSGenotypes_REF19imputedFiltered_deduped"
+} else if(dataset=="HP"){
+  VCFname <- "AllChrom_YellowGenotypes_REF19imputedAndFiltered"
+}
+```
+
+
+
+## Subset for accessions with genotype data
+```{r}
+# Read in the deregressed BLUPs
+BLUPs <- readRDS(file=paste0(project_path, "data/alltrait_scaled_drgBLUPs_", dataset, "_", TCtrait, "_", "H2filter", filter_trial_byH2,  ".RDS"))
+
+
+# Read in names of genotyped samples
+accessionnames <- read.table(file= paste0(project_path, "data/", dataset, "_accessionnames.txt"))[,1]
+
+# Subset for BLUPs with genotype data
+BLUPs_mvsubset <- BLUPs %>% filter(germplasmName %in% accessionnames)
+print(paste0("Subset of ", nrow(BLUPs_mvsubset), " accessions"))
+saveRDS(BLUPs_mvsubset, file=paste0(project_path, "data/alltrait_scaled_drgBLUPs_genodsubset_", dataset, ".RDS"))
+
+# Save names
+genophenonames <- BLUPs_mvsubset$germplasmName
+```
+
+
+
+## Convert genotype matrix to bimbam format
+```{r}
+# Read in genotype dosage matrix
+genodata <- readRDS(file=paste0(project_path, "data/DosageMatrix_", dataset, ".RDS"))
+
+# Reattach sample names
+nrow(genodata) == length(accessionnames) #confirm correct dimensions
+rownames(genodata) <- accessionnames
+
+# Subset
+genodata_subset <- genodata %>% filter(rownames(genodata) %in% genophenonames)
+nrow(genodata_subset) == length(genophenonames) #confirm proper dimensions
+
+# Read in original SNP info and subset for those that passed MAF threshold
+SNPinfo <- read.table(file=paste0(project_path, "data/SNPinfo_", dataset, ".txt"))
+colnames(SNPinfo) <- c("SNP", "ALT", "REF")
+SNPinfo_MAFfilt <- SNPinfo[(SNPinfo$SNP %in% gsub("_[A-Z]$", "", colnames(genodata))),]
+nrow(SNPinfo_MAFfilt) == ncol(genodata_subset) #confirm dimensions
+
+# Convert to bimbam format
+bimbam <- cbind( SNPinfo_MAFfilt,
+                  t(genodata_subset))
+write.table(bimbam, file=paste0(project_path, "data/GenotypeMatrix_", dataset, ".bimbam"),
+          col.names = FALSE, row.names=FALSE, quote=FALSE)
+
+# Save named version for Stephens analysis
+write.table(bimbam, file=paste0(project_path, "data/GenotypeMatrix_Named_", dataset, ".bimbam"),
+          col.names = T, row.names=T, quote=FALSE)
+
+# Save list of sample names
+sample_names <- colnames(bimbam)[-c(1:3)]
+saveRDS(sample_names, file=paste0(project_path, "data/BimbamSampleNames_",dataset,".RDS"))
+
+
+# Save list of SNP names
+bimbamSNPorder <- bimbam$SNP
+write.table(bimbamSNPorder, file=paste0(project_path, "data/SNPorder_", dataset, ".txt", col.names=F, row.names=F)) 
+
+```
+
+
+## Generate a phenotypic data matrix in bimbam format
+Genotype file sample names and phenotype file sample names must be in the same order!!
+```{r}
+# Match with BLUPs to get them in the right order and subset for genotyped accessions
+Ordered_BLUPs <- left_join(as.data.frame(sample_names), 
+                           BLUPs, by=c("sample_names" = "germplasmName"))
+  
+# Check that order and dimensions are still correct
+nrow(Ordered_BLUPs) == length(sample_names)
+sum(Ordered_BLUPs$germplasmName != sample_names) == 0
+
+
+# Write out phenotypes in format for GEMMA
+write.table(Ordered_BLUPs[,-c(1)],
+            file=paste0(project_path, "data/BLUPmatrix_scaled_", dataset, ".txt"), 
+            col.names=F, row.names=F)
+
+
+# Write out phenotypes with names attached for Stephens analysis
+write.table(Ordered_BLUPs, 
+            file=paste0(project_path, "data/BLUPmatrix_scaled_named_", dataset, ".txt"), 
+            col.names=T)
+
+# confirm correct sample names and order
+sum(Ordered_BLUPs$sample_names != colnames(bimbam)[-c(1:3)]) == 0
+```
+
+
+## Generate covariates file
+```{r}
+# Read in PC decomposition
+genoPCA <- readRDS(file=paste0(project_path, "data/DosageMatrix_PCA_", dataset, ".RDS"))
+genoPCs <- as.data.frame(genoPCA$x)
+sample_names <- readRDS(file=paste0(project_path,"data/BimbamSampleNames_",dataset,".RDS"))
+
+# Make covariates matrix with first x PCs
+nPCs <- 5
+PreCovMat <- as.data.frame(cbind(rep(1,dim(genoPCs)[1]), genoPCs[,1:nPCs]))
+colnames(PreCovMat)[1] <- "intercept"
+PreCovMat$germplasmName <- rownames(genoPCs)
+
+# Add in chr 1 haplotype cluster covariates
+Chr1HapCovMat <- readRDS(file=paste0(project_path, "data/Chr1_hap_incidence_mat", dataset, ".RDS"))
+
+# Subset and order to match individuals in bimbam files, add haplotype cluster covariates
+CovMatNamed <- left_join(as.data.frame(sample_names), PreCovMat, by=c("sample_names"="germplasmName")) %>% 
+  left_join(Chr1HapCovMat, by=c("sample_names"="germplasmName"))
+
+if(nPCs == 0){CovMatNamed <- CovMatNamed[,-3]}
+
+# Confirm correct sample names and order
+sum(sample_names != CovMatNamed$sample_names) == 0
+
+# Write out covariates file 
+write.table(CovMatNamed[,-1], 
+            file=paste0(project_path, "data/Covariates_", nPCs, "PCs_Chr1Haps_", dataset, ".txt"), 
+            col.names=F, row.names=F)
+            
+# Write out covariates file with names for other analyses
+write.table(CovMatNamed, 
+            file=paste0(project_path, "data/Covariates_", nPCs, "PCs_Chr1Haps_named_", dataset, ".txt"),
+            col.names=T)
+
+```
