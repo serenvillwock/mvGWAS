@@ -1,0 +1,663 @@
+---
+title: "02c_revised_genotype_data_curation"
+output: html_document
+date: "2025-06-23"
+---
+
+```{r}
+library(tidyverse)
+setwd("/workdir/ssv42/mvGWAS/")
+```
+
+Subset `Report_6038_VCF_Ref_Version6.txt` containing raw DArT genotypes from CASS accessions for accessions of interest
+```{bash, eval=F}
+cd /workdir/ssv42/mvGWAS/
+bcftools query -l ./data/CASSgenotypedata/Report_6038_VCF_Ref_Version6.txt > ./data/CASSgenotypedata/Report_6038_samplenames.txt
+```
+
+```{r}
+#identify genotypes to extract
+vcfsamplenames <- read.table("./data/CASSgenotypedata/Report_6038_samplenames.txt") %>%
+  rename("samplename" = "V1") %>%
+  mutate(germplasmName = gsub("_A.*", "", samplename))
+
+#match accession names to BLUPs dataset
+BLUPs_data <- read.table(file=paste0(project_path, "data/BLUPmatrix_rev_scaled_named_", dataset, ".txt"))
+
+toextract <- vcfsamplenames[vcfsamplenames$germplasmName %in% BLUPs_data$sample_names,]
+length(unique(toextract$germplasmName)) #54
+
+write.table(toextract$samplename, quote=F, row.names =F, col.names = F, file="./data/CASSgenotypedata/samplestoextract.txt")
+```
+
+Preprocessing DART vcf for formatting issues:
+```{bash, eval=F}
+#remove lines with NA chromosomes
+bcftools view -Ou -e 'CHROM=="NA"' Report_6038_VCF_Ref_Version6.vcf | bcftools view -Oz -o Report_6038_VCF_Ref_Version6_noNA.vcf.gz
+
+#remove lines with scaffolds
+awk 'BEGIN{OFS="\t"} /^#/ || $1 !~ /Scaffold/' Report_6038_VCF_Ref_Version6_noNA.vcf.gz > Report_6038_VCF_Ref_Version6_noNA_noscaffolds.vcf.gz
+
+#fix header
+zcat Report_6038_VCF_Ref_Version6_noNA_noscaffolds.vcf.gz | awk '
+BEGIN {
+  # Print fixed header lines
+  print "##fileformat=VCFv4.2"
+  print "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+  for (i = 1; i <= 18; i++) {
+    printf "##contig=<ID=Chromosome%02d>\n", i
+  }
+}
+/^#CHROM/ {
+  print
+  header_found = 1
+  next
+}
+
+header_found {
+  print
+}
+' > Report_6038_VCF_Ref_Version6_fixed.vcf
+```
+
+```{bash, eval=F}
+cd ./data/CASSgenotypedata/
+bgzip Report_6038_VCF_Ref_Version6_fixed.vcf > Report_6038_VCF_Ref_Version6.vcf.gz
+bcftools sort Report_6038_VCF_Ref_Version6_fixed.vcf.gz > Report_6038_VCF_Ref_Version6_sorted.vcf
+bgzip  Report_6038_VCF_Ref_Version6_sorted.vcf
+bcftools index Report_6038_VCF_Ref_Version6_sorted.vcf.gz
+bcftools view -S samplestoextract.txt -Oz -o CASS_rawDART_genotypes.vcf.gz Report_6038_VCF_Ref_Version6_sorted.vcf.gz
+```
+
+Check duplicates with bcftools gtcheck:
+```{bash, eval=F}
+ bcftools gtcheck CASS_rawDART_genotypes.vcf.gz > CASS_gtcompare.txt
+```
+```{r}
+Disc_scores <- read.delim("./data/CASSgenotypedata/CASS_gtcompare.txt", skip=32, sep="\t", header=T) %>%
+  mutate(avg_discordance = X.4.Discordance/X.6.Number.of.sites.compared)
+
+Disc_scores$accession1 <- gsub("_A.*", "",Disc_scores$X.2.Query.Sample) %>% gsub("\\.", "-", .)
+Disc_scores$accession2 <- gsub("_A.*", "",Disc_scores$X.3.Genotyped.Sample) %>% gsub("\\.", "-", .)
+
+Disc_scores_dups <- Disc_scores %>% filter(accession1 == accession2)
+
+hist(Disc_scores_dups$avg_discordance, breaks=20)
+View(Disc_scores_dups %>% arrange(-avg_discordance))
+
+#identify duplicates that have high discordance with the other duplicates of the same accession
+avg_pairwise_disc <- Disc_scores_dups %>% group_by(X.2.Query.Sample, accession1) %>% 
+  summarise(mean_avg_disc = mean(avg_discordance)) %>%
+  mutate(toremove = case_when(mean_avg_disc >= 1 ~ "yes", T ~ "no" ))
+
+#duplicates to remove:
+removedsamples <- avg_pairwise_disc %>% filter(toremove == "yes")
+
+#to keep:
+dedup_samplenames <- avg_pairwise_disc %>% filter(toremove == "no") %>%
+  group_by(accession1) %>% arrange(-mean_avg_disc) %>%
+  summarise(uniquesample = X.2.Query.Sample[1]) 
+
+remaining <- Disc_scores %>%
+  filter(!accession1 %in% dedup_samplenames$accession1) %>%
+  group_by(accession1) %>%
+  summarise(n_dups = length(unique(X.2.Query.Sample)))
+
+#check that all remaining have only one sample
+which(remaining$n_dups > 1)
+
+remaining_samplenames <- Disc_scores %>%
+  filter(!accession1 %in% dedup_samplenames$accession1) %>%
+  group_by(accession1) %>%
+  summarise(uniquesample = X.2.Query.Sample[1])
+            
+#join selected samples from duplicates and unique samples:
+unique_samplenames <- full_join(dedup_samplenames, remaining_samplenames)
+
+write.table(unique_samplenames$uniquesample, col.names = F, row.names = F, quote=F, file=paste0("./data/CASSgenotypedata/dedup_CASS_samplename_list.txt"))
+
+```
+
+Subset for unique samples only:
+```{bash, eval=F}
+bcftools view -S dedup_CASS_samplename_list.txt -Oz -o CASS_rawDART_genotypes_dedup.vcf.gz CASS_rawDART_genotypes.vcf.gz
+
+#fix chromosome naming for consistency 
+zcat CASS_rawDART_genotypes.vcf.gz | sed -E 's/Chromosome0?|Chromosome//g' | bgzip > CASS_rawDART_genotypes_renamed.vcf.gz
+
+bcftools index
+```
+
+Check how many markers are the same across the CASS raw dart data and the Yellow raw dart data:
+```{bash, eval=F}
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' CASS_rawDART_genotypes_renamed.vcf.gz > CASS_rawDART_genotypes_sites.txt
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' ../YellowGenotypes.vcf.gz > Yellow_rawDART_genotypes_sites.txt
+
+comm -12 ../Yellow_rawDART_genotypes_sites.txt CASS_rawDART_genotypes_sites.txt > CASS_Yellow_rawDART_shared_sites.txt
+
+wc -l CASS_Yellow_rawDART_shared_sites.txt
+```
+12672 sites in common. Okay to merge.
+
+Merge CASS and Yellow DART genotypes: 
+```{bash, eval=F}
+cd .. 
+#standardize ref/alt alleles based on reference
+bcftools norm -f /home/ssv42/cassavaseqs/Mesculenta_305_numericchr_v6.fa --check-ref -ws -W -Oz -o ./CASSgenotypedata/CASS_rawDART_genotypes_normed.vcf.gz CASS_rawDART_genotypes_renamed.vcf.gz
+bcftools norm -f /home/ssv42/cassavaseqs/Mesculenta_305_numericchr_v6.fa --check-ref -ws -W -Oz -o YellowGenotypes_normed.vcf.gz YellowGenotypes.vcf.gz
+
+#merge after normalization
+bcftools merge -Oz -W --merge none -o CASS_Yellow_rawDART_merged.vcf.gz ./CASSgenotypedata/CASS_rawDART_genotypes_normed.vcf.gz YellowGenotypes_normed.vcf.gz
+```
+Total of 12874 sites.
+
+```{bash, eval=F}
+#merge without normalization: subset for matching REF alleles first then merge
+cut -f1,2 CASS_Yellow_rawDART_shared_sites.txt > CASS_Yellow_rawDART_sitestokeep.txt
+
+
+#this method does not seem to be subsetting correctly -- used vcftools instead
+#bcftools view -T CASS_Yellow_rawDART_sitestokeep.txt -Oz -o CASS_rawDART_genotypes_Yellowsharedsites.vcf.gz CASS_rawDART_genotypes_renamed.vcf.gz
+#bcftools view -T CASS_Yellow_rawDART_sitestokeep.txt -Oz -o ../YellowGenotypes_CASSsharedsites.vcf.gz ../YellowGenotypes.vcf.gz
+
+vcftools --gzvcf CASS_rawDART_genotypes_renamed.vcf.gz --positions CASS_Yellow_rawDART_sitestokeep.txt --out CASS_rawDART_genotypes_Yellowsharedsites --recode --recode-INFO-all
+mv CASS_rawDART_genotypes_Yellowsharedsites.recode.vcf CASS_rawDART_genotypes_Yellowsharedsites.vcf
+bgzip CASS_rawDART_genotypes_Yellowsharedsites.vcf
+bcftools index CASS_rawDART_genotypes_Yellowsharedsites.vcf.gz
+
+
+vcftools --gzvcf ../YellowGenotypes.vcf.gz --positions CASS_Yellow_rawDART_sitestokeep.txt --out ../YellowGenotypes_CASSsharedsites --recode --recode-INFO-all
+mv ../YellowGenotypes_CASSsharedsites.recode.vcf ../YellowGenotypes_CASSsharedsites.vcf
+bgzip ../YellowGenotypes_CASSsharedsites.vcf
+bcftools index YellowGenotypes_CASSsharedsites.vcf.gz
+
+
+cd ..
+bcftools merge -Oz -W --merge none -o CASS_Yellow_rawDART_merged_sharedsites.vcf.gz ./CASSgenotypedata/CASS_rawDART_genotypes_Yellowsharedsites.vcf.gz YellowGenotypes_CASSsharedsites.vcf.gz
+
+```
+Total of 12672 sites.
+
+
+Split the genome-wide VCF to per-chromosome VCF
+```{r, eval=T}
+require(furrr); plan(multisession, workers = 8)
+options(future.globals.maxSize=+Inf); options(future.rng.onMisuse="ignore")
+  
+vcfIn <- "/workdir/ssv42/mvGWAS/data/CASS_Yellow_rawDART_merged.vcf.gz"
+filters <-"" #"--minDP 4 --maxDP 50" # because using GT not PL for impute (Beagle5)
+outPath <- "/workdir/ssv42/mvGWAS/data/"
+outSuffix <- "MergedCASSYellowDARTGenotypes"
+
+future_map(1:18,
+           ~genomicMateSelectR::splitVCFbyChr(Chr=.,
+                                              vcfIn=vcfIn,filters=filters,
+                                              outPath=outPath,
+                                              outSuffix=outSuffix))
+plan(sequential)
+```
+
+Copy the data from the 2019 imputation reference panel
+```{bash, eval=F}
+mkdir ImputationRefPanel
+
+cp /home/jj332_cas/CassavaGenotypeData/nextgenImputation2019/ImputationStageIII_72619/chr*_RefPanelAndGSprogeny_ReadyForGP_72719.vcf.gz  ./ImputationRefPanel/
+
+cp -r /home/jj332_cas/CassavaGenotypeData/CassavaGeneticMap ./ImputationRefPanel/
+```
+```{r}
+#standardize ref panel to v6 ref/alt allele information:
+purrr::map(1:18, ~system(paste0("cd /workdir/ssv42/mvGWAS/data/; bcftools norm -f /home/ssv42/cassavaseqs/Mesculenta_305_numericchr_v6.fa --check-ref -ws --write-index -Oz -o ./ImputationRefPanel/chr",.,"_RefPanelAndGSprogeny_ReadyForGP_72719_normed.vcf.gz ./ImputationRefPanel/chr",.,"_RefPanelAndGSprogeny_ReadyForGP_72719.vcf.gz")))
+
+#bcftools norm -f /home/ssv42/cassavaseqs/Mesculenta_305_numericchr_v6.fa --check-ref -ws -W -Oz -o ./ImputationRefPanel/CASS_rawDART_genotypes_normed.vcf.gz CASS_rawDART_genotypes_renamed.vcf.gz
+```
+
+Run imputation one chromosome at a time
+```{r, eval=T}
+targetVCFpath <- "/workdir/ssv42/mvGWAS/data/" # location of the target VCF
+refVCFpath <- "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/"
+mapPath <-  "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/CassavaGeneticMap/"
+outPath <- "/workdir/ssv42/mvGWAS/data/imputation_output/"
+outSuffix <- "MergedCASSYellowDARTGenotypes"
+
+purrr::map(1:18,
+           ~genomicMateSelectR::runBeagle5(targetVCF=paste0(targetVCFpath,"chr",.,
+                                                            "_MergedCASSYellowDARTGenotypes.vcf.gz"),
+                                           refVCF=paste0(refVCFpath,"chr",.,
+                                                         "_RefPanelAndGSprogeny_ReadyForGP_72719_normed.vcf.gz"),
+                                           mapFile=paste0(mapPath,"chr",.,
+                                                          "_cassava_cM_pred.v6_91019.map"),
+                                           outName=paste0(outPath,"chr",.,
+                                                          "_MergedCASSYellowDARTGenotypes_REF19imputed"), nthreads=18))
+```
+
+Post-impute filter.
+Standard post-imputation filter: AR2>0.75 (DR2>0.75 as of Beagle5.0), P_HWE>1e-20, MAF>0.005 [0.5%].
+Loop to filter all 18 VCF files in parallel
+```{r, eval=T}
+inPath <- "/workdir/ssv42/mvGWAS/data/imputation_output/"
+outPath <- "/workdir/ssv42/mvGWAS/data/imputation_output/"
+require(furrr); plan(multisession, workers = 18)
+future_map(1:18,
+           ~genomicMateSelectR::postImputeFilter(inPath=inPath,
+                                                 inName=paste0("chr",.,"_MergedCASSYellowDARTGenotypes_REF19imputed"),
+                                                 outPath=outPath,
+                                                 outName=paste0("chr",.,"_MergedCASSYellowDARTGenotypes_REF19imputedAndFiltered"),
+                                                 DR2thresh = 0.75,
+                                                 HWEthresh = 1e-20,
+                                                 MAFthresh = 0.005)) #will add more stringent filter later after subsetting
+plan(sequential)
+
+#check how many markers passed the filter:
+purrr::map(1:18,~system(paste0("zcat ",
+                               "/workdir/ssv42/mvGWAS/data/imputation_output/",
+                        "chr",.,"_MergedCASSYellowDARTGenotypes_REF19imputedAndFiltered.vcf | wc -l")))
+```
+
+Merge chromosomes back together to make a genome-wide VCF:
+```{r, eval=T}
+## Index with tabix first
+future_map(1:18,~system(paste0("tabix -f -p vcf ",inPath,
+                               "chr",.,"_MergedCASSYellowDARTGenotypes_REF19imputedAndFiltered.vcf.gz")))
+plan(sequential)
+
+## bcftools concat
+system(paste0("bcftools concat ",
+              "--output ",outPath,
+              "AllChrom_MergedCASSYellowDARTGenotypes_REF19imputedAndFiltered.vcf.gz ",
+              "--output-type z --threads 10",
+              paste0(inPath,"chr",1:18,
+                     "_MergedCASSYellowDARTGenotypes_REF19imputedAndFiltered.vcf.gz",
+                     collapse = " ")))
+
+## Check the final file:
+system(paste0("bcftools stats /workdir/ssv42/mvGWAS/data/imputation_output/AllChrom_MergedCASSYellowDARTGenotypes_REF19imputedAndFiltered.vcf.gz"))
+
+
+```
+Now we have 41233 SNPs after filtering.
+
+
+
+
+
+
+
+Alternate version without REF/ALT normalization:
+Split the genome-wide VCF to per-chromosome VCF
+```{r, eval=T}
+require(furrr); plan(multisession, workers = 8)
+options(future.globals.maxSize=+Inf); options(future.rng.onMisuse="ignore")
+  
+vcfIn <- "/workdir/ssv42/mvGWAS/data/CASS_Yellow_rawDART_merged_sharedsites.vcf.gz"
+filters <- "" #"--minDP 4 --maxDP 50" # because using GT not PL for impute (Beagle5)
+outPath <- "/workdir/ssv42/mvGWAS/data/"
+outSuffix <- "MergedCASSYellowDARTGenotypesSharedSites"
+
+future_map(1:18,
+           ~genomicMateSelectR::splitVCFbyChr(Chr=.,
+                                              vcfIn=vcfIn,filters=filters,
+                                              outPath=outPath,
+                                              outSuffix=outSuffix))
+plan(sequential)
+```
+
+Run imputation one chromosome at a time
+```{r, eval=T}
+targetVCFpath <- "/workdir/ssv42/mvGWAS/data/" # location of the target VCF
+refVCFpath <- "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/"
+mapPath <-  "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/CassavaGeneticMap/"
+outPath <- "/workdir/ssv42/mvGWAS/data/imputation_output/"
+outSuffix <- "MergedCASSYellowDARTGenotypes"
+
+purrr::map(1:18,
+           ~genomicMateSelectR::runBeagle5(targetVCF=paste0(targetVCFpath,"chr",.,
+                                                            "_MergedCASSYellowDARTGenotypesSharedSites.vcf.gz"),
+                                           refVCF=paste0(refVCFpath,"chr",.,
+                                                         "_RefPanelAndGSprogeny_ReadyForGP_72719.vcf.gz"),
+                                           mapFile=paste0(mapPath,"chr",.,
+                                                          "_cassava_cM_pred.v6_91019.map"),
+                                           outName=paste0(outPath,"chr",.,
+                                                          "_MergedCASSYellowDARTGenotypesSharedSites_REF19imputed"), nthreads=18))
+```
+
+Post-impute filter.
+Standard post-imputation filter: AR2>0.75 (DR2>0.75 as of Beagle5.0), P_HWE>1e-20, MAF>0.005 [0.5%].
+Loop to filter all 18 VCF files in parallel
+```{r, eval=T}
+inPath <- "/workdir/ssv42/mvGWAS/data/imputation_output/"
+outPath <- "/workdir/ssv42/mvGWAS/data/imputation_output/"
+require(furrr); plan(multisession, workers = 18)
+future_map(1:18,
+           ~genomicMateSelectR::postImputeFilter(inPath=inPath,
+                                                 inName=paste0("chr",.,"_MergedCASSYellowDARTGenotypesSharedSites_REF19imputed"),
+                                                 outPath=outPath,
+                                                 outName=paste0("chr",.,"_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered"),
+                                                 DR2thresh = 0.75,
+                                                 HWEthresh = 1e-20,
+                                                 MAFthresh = 0.005)) #will add more stringent filter later after subsetting
+plan(sequential)
+
+#check how many markers passed the filter:
+purrr::map(1:18,~system(paste0("zcat ",
+                               "/workdir/ssv42/mvGWAS/data/imputation_output/",
+                        "chr",.,"_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered.vcf | wc -l")))
+```
+
+Merge chromosomes back together to make a genome-wide VCF:
+```{r, eval=T}
+inPath <- "/workdir/ssv42/mvGWAS/data/imputation_output/"
+outPath <- "/workdir/ssv42/mvGWAS/data"
+
+## Index with tabix first
+future_map(1:18,~system(paste0("tabix -f -p vcf ",inPath,
+                               "chr",.,"_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered.vcf.gz")))
+plan(sequential)
+
+## bcftools concat
+system(paste0("bcftools concat ",
+              "--output ",outPath,
+              "AllChrom_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered.vcf.gz ",
+              "--output-type z --threads 10",
+              paste0(inPath,"chr",0:18, #not sure why I have to start this at 0 to get chr 1?
+                     "_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered.vcf.gz",
+                     collapse = " ")))
+
+## Check the final file:
+system(paste0("bcftools stats /workdir/ssv42/mvGWAS/data/AllChrom_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered.vcf.gz"))
+
+```
+Now we have 49218 SNPs after filtering.
+
+
+Convert VCF to dosage matrix with bcftools query
+("genomicMateSelectR::convertVCFtoDosage" does not respect floats) 
+```{bash, eval=F}
+(echo -e "CHROM\tPOS\tID\tREF\tALT"$(bcftools query -l AllChrom_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered.vcf.gz | awk '{printf "\t%s", $1}'); \
+ bcftools query -f '%CHROM\t%POS\t%ID\t%REF\t%ALT[\t%DS]\n' AllChrom_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered.vcf.gz) \
+> AllChrom_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered.dosagematrix
+```
+
+Get dosage matrix
+```{r}
+genomat_rev <- read.table("/workdir/ssv42/mvGWAS/data/AllChrom_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered.dosagematrix", header=T)
+
+#separate SNP info columns and transpose from snps x samples to samples x snps
+genomat_SNPinfo <- genomat_rev[,1:5]
+genomat_dosages <- t(genomat_rev[,-c(1:5)]) %>% as.data.frame() 
+colnames(genomat_dosages) <- genomat_SNPinfo$ID
+genomat_dosages$samplename <- rownames(genomat_dosages)
+
+#extract accession name
+genomat_dosages$accession <- gsub("\\.", "-", genomat_dosages$samplename) %>% gsub("_A.*", "", .)
+
+#save SNP info
+saveRDS(genomat_SNPinfo, file=paste0(project_path, "data/AllChrom_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered_SNPinfo.RDS"))
+```
+
+Get subset of unique samples with phenotype data
+```{r}
+#remove duplicate accessions 
+dup_accessions <- genomat_dosages$accession[which(duplicated(genomat_dosages$accession))]
+
+#check how highly correlated duplicates are to spot potential mismatches; keep one most highly correlated across duplicates
+set.seed(14850)
+dup_names <- unique(dup_accessions)
+dups_tokeep <- c()
+for (i in seq_along(dup_names)){
+  print(i)
+  dup_genos_i <- genomat_dosages %>% filter(accession == dup_names[i])
+  dup_genos_subset <- dup_genos_i[,sample(ncol(dup_genos_i)-2, 10000)] #downsample SNPs
+  dup_cor_mat <- cor(t(dup_genos_subset)) #correlation across samples
+  #print(rowSums(dup_cor_mat) / dim(dup_cor_mat)[1])
+  tokeep <- max(rowSums(dup_cor_mat) / dim(dup_cor_mat)[1] ) #pick the one that has the most consensus
+  tokeep_name <- which.max(rowSums(dup_cor_mat) / dim(dup_cor_mat)[1] )
+  print(c(dup_names[i], tokeep))
+  if(tokeep > 0.8){ #as long as it has a high enough average correlation
+  dups_tokeep <- c(dups_tokeep, names(tokeep_name)) }
+}
+
+#discordant duplicate pairs that couldn't be corroborated/resolved
+#suspicious <- c("IITA.TMS.IBA210092_A45989", "IITA.TMS.IBA210092_A45862", "IITA.TMS.IBA210218_A45938", "IITA.TMS.IBA210218_A45897","IITA.TMS.IBA210222_A45924","IITA.TMS_IBA210222_A45879", "IITA.TMS.IBA154810_A35063 IITA.TMS.IBA154810_A45824")
+
+
+
+#subset for those with BLUPs
+project_path <- "/workdir/ssv42/mvGWAS/"
+BLUPs <- readRDS(file=paste0(project_path, "data/alltrait_scaled_drgBLUPs_rev_CASS_TCICHK_H2filterFALSE.RDS")) 
+
+genomat_dosages_dedup <- genomat_dosages %>%
+  filter(!grepl("ITH21", accession)) %>% filter(!grepl("HIL16", accession)) %>% #filter out ITH accessions
+  filter(!accession %in% dup_names | samplename %in% dups_tokeep) %>%
+  filter(accession %in% BLUPs$germplasmName) 
+rownames(genomat_dosages_dedup) <- genomat_dosages_dedup$accession
+
+
+#filter for MAF
+AF <- colSums(genomat_dosages_dedup[,1:(ncol(genomat_dosages_dedup)-2)]) / (nrow(genomat_dosages_dedup)*2)
+MAF_pass <- AF >=0.05 & AF <=0.95
+
+genomat_ready <- genomat_dosages_dedup[,MAF_pass] %>%
+  dplyr::select(-accession) %>% dplyr::select(-samplename)
+
+dim(genomat_ready)
+
+saveRDS(genomat_ready, file="./data/genomat_rev.RDS")
+```
+377 individuals, 43720 SNPs after MAF filtering
+
+
+
+
+
+
+Get PSY2 KASP marker genotypes for individuals in which it was observed directly:
+Extract PSY2 KASP marker
+```{bash, eval=F}
+bcftools view -r 1:24155522 -Oz -o PSY2KASP_observed_genotypes.vcf.gz chr1_RefPanelAndGSprogeny_ReadyForGP_72719_plusKASP_sorted.vcf.gz
+```
+
+Subset for those with BLUPs (45 accessions)
+```{r}
+library(vcfR)
+PSY2obs <- read.vcfR("./data/PSY2KASP_observed_genotypes.vcf.gz")
+PSY2obs_gt <- extract.gt(PSY2obs) %>% t() %>% as.data.frame() %>% filter(!is.na(S1_24155522))
+
+#calculate allele dosage and join with genomat
+genomat_plusPSYobs <- PSY2obs_gt %>% rownames_to_column("accession") %>%
+  mutate(S1_24155522 = case_when(
+    S1_24155522 == "1/1" ~ 2,
+    S1_24155522 == "0/0" ~ 0,
+    S1_24155522 == "1/0" | S1_24155522 == "0/1" ~ 1, T~NA)) %>%
+  right_join(genomat_ready %>% rownames_to_column("accession"))
+
+```
+
+
+Re-run imputation for chromosome 1 with the KASP/DART overlap dataset to impute the PSY2 marker:
+```{r, eval=T}
+targetVCFpath <- "/workdir/ssv42/mvGWAS/data/" # location of the targetVCF
+refVCFpath <- "/workdir/ssv42/mvGWAS/data/"
+mapPath <-  "/workdir/ssv42/mvGWAS/data/ImputationRefPanel/CassavaGeneticMap/"
+outPath <- "/workdir/ssv42/mvGWAS/data/"
+
+#Use only the complete set of overlapped Dart & KASP accessions as the reference
+refVCFpath <- "/workdir/ssv42/mvGWAS/data/"
+outPath <- "/workdir/ssv42/mvGWAS/data/"
+
+genomicMateSelectR::runBeagle5(targetVCF=paste0(targetVCFpath,
+                                "chr",1, "_MergedCASSYellowDARTGenotypesSharedSites.vcf.gz"),
+                                           refVCF=paste0(refVCFpath,"chr",1,
+"_RefPanelAndGSprogeny_ReadyForGP_72719_plusKASP_completesetonly_sorted_phased.vcf.gz"),
+                                           mapFile=paste0(mapPath,"chr",1,
+                                                          "_cassava_cM_pred.v6_91019.map"),
+                                           outName=paste0(outPath,"chr",1,
+                                                          "_MergedCASSYellowDARTGenotypesSharedSites_REF19KASPimputed_wcompletesetonly"), nthreads=12)
+
+```
+DR2 is lower at 0.31
+
+```{bash, eval=F}
+bcftools index chr1_MergedCASSYellowDARTGenotypesSharedSites_REF19KASPimputed_wcompletesetonly.vcf.gz
+
+bcftools view -r 1:24155522 -Oz -o PSY2KASPimputed_24155522only.vcf.gz chr1_MergedCASSYellowDARTGenotypesSharedSites_REF19KASPimputed_wcompletesetonly.vcf.gz  
+
+#extract allele dosage
+(echo -e "CHROM\tPOS\tID\tREF\tALT"$(bcftools query -l PSY2KASPimputed_24155522only.vcf.gz | awk '{printf "\t%s", $1}'); \
+ bcftools query -f '%CHROM\t%POS\t%ID\t%REF\t%ALT[\t%DS]\n' PSY2KASPimputed_24155522only.vcf.gz) \
+> PSY2KASPimputed_24155522only.dosagematrix
+```
+
+Use imputed markers for individuals not genotyped directly with KASP
+```{r}
+PSY2_KASP_imputed <- read.table("/workdir/ssv42/mvGWAS/data/PSY2KASPimputed_24155522only.dosagematrix", header=T)
+
+#separate SNP info columns and transpose from snps x samples to samples x snps
+PSY2_KASP_SNPinfo <- PSY2_KASP_imputed[,1:5]
+PSY2_imp_dosages <- t(PSY2_KASP_imputed[,-c(1:5)]) %>% as.data.frame() 
+colnames(PSY2_imp_dosages) <- paste0(PSY2_KASP_SNPinfo$ID,"_imp")
+PSY2_imp_dosages$samplename <- rownames(PSY2_imp_dosages)
+
+#extract accession name
+PSY2_imp_dosages$accession <- gsub("\\.", "-", PSY2_imp_dosages$samplename) %>% gsub("_A.*", "", .)
+
+#subset for where PSY2 was not directly genotyped
+PSY2missingaccessions <- genomat_plusPSYobs$accession[is.na(genomat_plusPSYobs$S1_24155522)]
+
+#use imputed PSY2 to fill in where it is missing
+genomat_plusPSY_filled <- PSY2_imp_dosages %>% filter(!accession %in% dup_names | samplename %in% dups_tokeep) %>% #remove dups
+    dplyr::select(-samplename) %>%
+    right_join(genomat_plusPSYobs, by="accession") %>%
+    mutate(S1_24155522 = coalesce(S1_24155522, S1_24155522_imp)) %>% #fill in NAs with imputed value
+  dplyr::select(-S1_24155522_imp) %>%
+  column_to_rownames("accession")
+  
+
+#save genotype data plus KASP marker
+saveRDS(genomat_plusPSY_filled, file="./data/genomat_rev_plusPSY2KASP.RDS")
+saveRDS(rownames(genomat_plusPSY_filled), file="./data/genomat_rev_plusPSY2KASP_germplasmNames.RDS")
+
+#save imputed PSY2 marker only
+PSY2_imputed_rev <- data.frame(cbind(germplasmName = rownames(genomat_plusPSY_filled), S1_24155522 = genomat_plusPSY_filled[,"S1_24155522"] ))
+PSY2_imputed_rev$S1_24155522 <- as.numeric(PSY2_imputed_rev$S1_24155522)
+saveRDS(PSY2_imputed_rev, file="./data/PSY2KASP_revimputed_unrounded.RDS")
+```
+
+
+Make GRM
+```{r, eval=F}
+## Calculate the relationship matrices using rrBLUP:
+
+#subset for individuals with either TCICHK or DM BLUPs present
+BLUPs_TCIHCK_DM <- readRDS(file=paste0(project_path, "data/BLUPmatrix_rev_genodsubset.RDS")) %>% 
+  filter(!is.na(TCICHK) | !is.na(DM))
+
+# Read in revised genotype matrix 
+genomat_SNPs <- readRDS(file="./data/genomat_rev.RDS") %>% filter(rownames(.) %in% BLUPs_TCIHCK_DM$germplasmName)
+
+# Subset for SNPs not in the chromosome 1 covariate haplotypes
+haps_PSY2region <- readRDS(file=paste0(project_path, "data/Haplotypes_PSY2region_", dataset, ".RDS"))
+PSY2regionSNPs <- paste0("S", gsub("_[A-Z]_[A-Z]$", "", colnames(haps_PSY2region)))
+
+#ROG = rest of genome besides PSY2 region
+genomat_ROG <- genomat_SNPs %>% dplyr::select(colnames(genomat_SNPs)[!colnames(genomat_SNPs) %in% PSY2regionSNPs]) 
+
+#dim(genomat_ROG): n = 374, p = 43712
+
+#just for the purposes of calculating G matrix: round imputed values to integers
+genomat_ROG_rounded <- round(genomat_ROG)
+
+# Calculate relationship matrix
+GMatrix_ROG <- ASRgenomics::G.matrix(M=as.matrix(genomat_ROG_rounded), method="VanRaden")[[1]]
+
+# Check GRM
+ck <- ASRgenomics::kinship.diagnostics(GMatrix_ROG)
+ck$list.duplicate
+ck$plot.diag
+ck$plot.offdiag 
+
+# Blend GRM to improve diagonal values
+Gblend <- ASRgenomics::G.tuneup(GMatrix_ROG, blend=TRUE, pblend=0.05)$Gb
+ck2 <- ASRgenomics::kinship.diagnostics(Gblend)
+
+# Blend & Invert GRM
+Ginv_ROG_sparse <- ASRgenomics::G.inverse(Gblend, sparseform=TRUE)$Ginv
+
+saveRDS(Ginv_ROG_sparse, file=paste0(project_path, "data/Ginverse_ROG_sparse_rev.RDS"))
+saveRDS(colnames(GMatrix_ROG), file=paste0(project_path, "data/G_ROG_rev_sampleorder.RDS"))
+
+```
+
+
+Calculate PC covariates:
+(note: run in separate terminal window to keep Rstudio console free)
+```{r, eval=F}
+#principal component analysis
+genomat_SNPs <- readRDS(file="/workdir/ssv42/mvGWAS/data/genomat_rev.RDS") 
+dosagesPCA <- prcomp(genomat_SNPs)
+
+#extract first 5 PCs as covariates
+PCcovariates <- (dosagesPCA$x)[,1:5]
+
+saveRDS(dosagesPCA, "/workdir/ssv42/mvGWAS/data/UnroundedDosageMatrix_PCA_rev.RDS")
+saveRDS(PCcovariates, "/workdir/ssv42/mvGWAS/data/PCcovariates_rev.RDS")
+```
+
+Plot PC variance explained: 
+5 PCs is the elbow of the plot
+```{r}
+dosagesPCA <- readRDS("/workdir/ssv42/mvGWAS/data/UnroundedDosageMatrix_PCA_rev.RDS")
+
+PCimportance <- t(summary(dosagesPCA)$importance) %>% as.data.frame()
+PCimportance$PC <- as.numeric(gsub("PC","", rownames(PCimportance)))
+  
+ggplot(PCimportance, aes(x=PC, y=`Proportion of Variance`)) +
+       geom_point() + xlim(0,20)
+
+ggsave(file=paste0(project_path, "figures/PCA_PVE_rev.png"))
+```
+
+
+
+Estimate effective number of markers as in Gao et al. 2008:
+```{r, eval=F}
+genomat_ready <-readRDS(file="./data/genomat_rev.RDS")
+
+#function to estimate effective number of markers per chromosome
+Meff_estimation <- function(inmat){
+  SNPcormat <- cor(inmat)
+  eigenresults <- eigen(SNPcormat)
+  cumulativevar <- cumsum(eigenresults$values)/sum(eigenresults$values)
+  n_eigen <- min(which(cumulativevar > 0.995))
+  
+  #SNPcor_pca <- prcomp(SNPcormat)
+  #number of eigenvalues explaining 99.5% in SNP correlation matrix
+  #n_eigen <- length(which(summary(SNPcor_pca)$importance["Cumulative Proportion",] < 0.995)) + 1
+  return(n_eigen)
+}
+
+#run by chromosome
+library(furrr)
+plan(multisession, workers = 18)
+
+Meff_list <- future_map(1:18, function(chr) {
+  chr_cols <- grep(paste0("S", chr, "_"), colnames(genomat_ready), value = TRUE)
+  chrinput <- genomat_ready[, chr_cols, drop = FALSE] 
+  Meff_chr <- Meff_estimation(inmat = chrinput)
+  print(dim(chrinput)); print(Meff_chr)
+  return(Meff_chr)
+})
+
+
+saveRDS(unlist(Meff_list), file=paste0(project_path, "output/Meff_rev_estimates_perchr_eigenmethod.RDS"))
+sum(unlist(Meff_list)) #3657 (formerly 594 with PCA method which seemed too low)
+
+Gao.cutoff <- round(0.05/sum(unlist(Meff_list)),8)
+print(Gao.cutoff) #1.367e-05
+```
+
+
+
+
+
+

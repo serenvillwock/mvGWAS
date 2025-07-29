@@ -1,0 +1,1953 @@
+---
+title: "submitted_version_mvMLMM"
+output: html_document
+date: "2025-07-15"
+---
+
+
+```{r}
+setwd("/workdir/ssv42/mvGWAS/")
+library(tidyverse)
+project_path <- "/workdir/ssv42/mvGWAS/"
+```
+
+Set-up
+(Note: copy and paste into terminal R session so Rstudio remains free)
+```{r}
+library(tidyverse); library(asreml); library(aod)
+project_path <- "/workdir/ssv42/mvGWAS/"
+dataset <- "CASS"
+ncores <- 60
+  
+### DEBUG settings -- test run one SNP model
+DEBUG <- TRUE
+
+#read in original drgBLUP phenotype data
+BLUPs_data <- readRDS(file=paste0(project_path, "data/BLUPs_scaled_and_hap_data_", dataset, ".RDS")) 
+  
+# Read in revised genotype matrix 
+genomat_SNPs <- readRDS(file="./data/genomat_rev.RDS")
+#dim(genomat_SNPs) #377 x 43720
+  
+# Filter for common accessions
+common_acc <- intersect(rownames(genomat_SNPs), BLUPs_data$germplasmName)
+genomat_SNPs <- genomat_SNPs[common_acc,]
+BLUPs_data <- BLUPs_data %>% filter(germplasmName %in% common_acc)
+      
+# Get fresh relationship matrix
+# #just for the purposes of calculating G matrix: round imputed values to integers
+# genomat_rounded <- round(genomat_SNPs)
+# GMatrix <- ASRgenomics::G.matrix(M=as.matrix(genomat_rounded), method="VanRaden")[[1]]
+
+# # Blend GRM to improve diagonal values
+# Gblend <- ASRgenomics::G.tuneup(GMatrix, blend=TRUE, pblend=0.05)$Gb
+# checkG <- ASRgenomics::kinship.diagnostics(Gblend)
+
+# # Invert GRM
+# Ginverse <- ASRgenomics::G.inverse(Gblend, sparseform=FALSE)$Ginv
+# saveRDS(Ginverse, file=paste0(project_path, "data/Ginverse_revisedimputation.RDS"))
+      
+Ginverse <- readRDS(file=paste0(project_path, "data/Ginverse_revisedimputation.RDS"))
+Gsampleorder <- rownames(Ginverse) #make sure names are the same order
+      
+      
+# Add computational group sections to SNPs
+genomat_t <- t(genomat_SNPs) %>% as.data.frame()
+genomat_t$SNP <- rownames(genomat_t)
+nSNPs <- dim(genomat_t)[1]
+genomat_t$compute_group <- as.numeric(cut_number(c(1:nSNPs), ncores))
+#saveRDS(genomat_t, file=paste0(project_path, "data/genomat_t_revised.RDS"))
+      
+      
+# Read in imputed PSY2 KASP marker covariate
+PSY2_imputed_rev <- readRDS(file=paste0(project_path, "data/PSY2KASP_revimputed_unrounded.RDS"))
+      # Get original PSY2 KASP marker covariate
+      # genomat_KASP_OG <- readRDS(file=paste0(project_path, "data/genomat_plusKASP_filtered.RDS"))
+      #  PSY2marker_OG <- as.data.frame(t(genomat_KASP_OG[genomat_KASP_OG$SNP == "S1_24155522",] %>%
+      #   dplyr::select(-c("SNP","ALT","REF","compute_group"))))
+      #  colnames(PSY2marker_OG) <- "S1_24155522"
+      #  PSY2marker_OG$germplasmName <- rownames(PSY2marker_OG)
+      #  PSY2marker_OG$S1_24155522_dom <- ifelse(PSY2marker_OG$S1_24155522 == 1, 1, 0) 
+    
+#Get PC covariates
+PCcovariates <- readRDS("/workdir/ssv42/mvGWAS/data/PCcovariates_rev.RDS") %>%
+  as.data.frame() %>% rownames_to_column("germplasmName")
+      # Get original PC covariates
+       # PCaccessionnames <- read.table(file= paste0(project_path, "data/", dataset, "_accessionnames.txt"))[,1]
+       # dosagesPC <- as.data.frame(readRDS(file=paste0(project_path,
+       #"data/DosageMatrix_PCA_CASS_PCmatrix_copy.RDS")))[,1:5]
+       # dosagesPC$germplasmName <- PCaccessionnames
+      
+#Get weights
+BLUPs_revised <- readRDS(file=paste0(project_path,
+                                     "data/alltrait_scaled_drgBLUPs_rev_CASS_TCICHK_H2filterFALSE.RDS")) %>%
+  filter(germplasmName %in% Gsampleorder) %>%
+  mutate(acc_weight = rowMeans(cbind(TCICHK_weight, DM_weight), na.rm = TRUE)) %>% 
+  #use mean of the two traits for accession-level weights 
+  mutate(acc_weight = case_when(is.na(acc_weight) ~ min(acc_weight, na.rm=T), T ~ acc_weight))
+  #fill any NAs with the lowest weight
+BLUP_weights <- BLUPs_revised %>% dplyr::select(germplasmName, TCICHK_weight, DM_weight, acc_weight)
+      
+#Merge BLUP and PSY2 marker data together, ensuring correct order of sample names
+BLUPs_PSY2_data <- left_join(data.frame(germplasmName = Gsampleorder), BLUPs_data, by="germplasmName") %>%
+  left_join(PSY2_imputed_rev, by="germplasmName") %>%
+  left_join(PCcovariates, by="germplasmName") %>%
+  left_join(BLUP_weights, by="germplasmName") %>%
+  mutate(germplasmName = as.factor(germplasmName))
+
+#saveRDS(BLUPs_PSY2_data, file=paste0(project_path, "data/BLUPs_PSY2_revised_data_0716.RDS"))
+      
+#confirm correct order
+all(BLUPs_PSY2_data$germplasmName == Gsampleorder)
+length(BLUPs_PSY2_data$germplasmName) == 376
+nAccessions <- length(BLUPs_PSY2_data$germplasmName) 
+      
+# Get starting values to help model
+T1 <- asreml(data = BLUPs_PSY2_data, 
+                 fixed = TCICHK ~ 1 + S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5, 
+                 random = ~ vm(germplasmName, Ginverse),
+                 residual = ~units)
+      
+Vg_TCICHK <- summary(T1)$varcomp$component[1]
+      
+T2 <- asreml(data = BLUPs_PSY2_data, 
+                   fixed = DM ~ 1 + S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5, 
+                   random = ~ vm(germplasmName, Ginverse),
+                   residual = ~units)
+Vg_DM <- summary(T2)$varcomp$component[1]
+      
+Cov_TCICHK_DM <- cor(BLUPs_PSY2_data$TCICHK, BLUPs_PSY2_data$DM, use='complete.obs')
+initG <- c(Cov_TCICHK_DM, Vg_TCICHK, Vg_DM) #trait *correlation*, TCICHK gen variance, DM gen variance
+
+#saveRDS(initG, file=paste0(project_path, "data/initG_revisedimputation.RDS"))
+    
+
+```
+
+Define mvGWAS function
+```{r}
+
+SNP_GWAS_PCs_function <- function(section){
+  
+  #load packages
+  library(tidyverse); library(asreml); library(aod)
+  
+  #select SNPs in this compute group
+  section_SNPs <- genomat_t %>% filter(compute_group == section)
+
+  
+  # Loop across all "rest of genome" SNPs 
+  #storage for SNP effects
+  all_SNP_results_df <- as.data.frame(matrix(nrow = nrow(section_SNPs), ncol = 18))
+  colnames(all_SNP_results_df) <- c("level", "status", 
+                                    "BetaSNP_TCICHK", "BetaSNP_DM", "BetaSNP_TCICHK.se", "BetaSNP_DM.se", "BetaSNP_TCICHKDM.cov", 
+                                   "PSY2_TCICHK", "PSY2_DM", "PSY2_TCICHK.se", "PSY2_DM.se",
+                                    # "PSY2_dom_TCICHK", "PSY2_dom_TCICHK.se", "PSY2_dom_DM", "PSY2_dom_DM.se", 
+                                    "chi2", "df", "P", "resid_gen_cov", "resid_gen_cov.se", "error_cov", "error_cov.se")
+  
+  #storage for model objects
+  #model_storage <- list()
+
+  SNPstotest <- seq_along(section_SNPs$SNP)
+  if(DEBUG == TRUE){ SNPstotest <- 1 }
+  
+  for(i in SNPstotest){
+    
+    #debug note: chr 1 peak is at i = 292 
+    SNPi <- section_SNPs$SNP[i]
+    SNPidata <- as.data.frame(t(section_SNPs[i,1:nAccessions]))
+    colnames(SNPidata) <- paste0(SNPi)
+    SNPidata$germplasmName <- rownames(SNPidata)
+
+    modeldata <- left_join(BLUPs_PSY2_data, SNPidata, by="germplasmName") %>% 
+      mutate(germplasmName = as.factor(germplasmName))
+    #modeldata <<- modeldata
+    
+    
+    # DEBUG
+    # test base model
+    # basemodel <- asreml(data = modeldata,
+    #     formula(paste0("cbind(TCICHK, DM) ~ trait + trait:S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+    #      random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+    #     residual = ~units:corgh(trait), maxit=20)
+    
+    # test weighted model -- doesn't work (Sigma2 goes to 0, LogLik goes to -inf)
+    # weightsmodel <- asreml(data = modeldata,
+    #     formula(paste0("cbind(TCICHK, DM) ~ trait + trait:S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+    #      random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+    #     residual = ~units:corgh(trait), maxit=20, weights=acc_weight_inv)
+  
+    #model calculating SNP effect on each trait
+    SNPimodel <- asreml(data = modeldata,
+        formula(paste0("cbind(TCICHK, DM) ~ trait + trait:", SNPi, 
+                       " + trait:S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+        residual = ~units:us(trait), maxit=20, weights=acc_weight)
+    
+    model_varcomp_i <- summary(SNPimodel)$varcomp
+    PSY2SNPestimates <- summary(SNPimodel, coef=T)$coef.fixed[1:2,1:2]
+  
+    #save model
+    #SNPimodel <<- SNPimodel
+    #model_storage[[i]] <<- SNPimodel
+
+    #predict SNP effects
+    SNPlevel <- list(1)
+    names(SNPlevel) <- SNPi
+    predictSNPeffects <- predict.asreml(SNPimodel, vcov=T, 
+                                        classify=paste0("trait:", SNPi), 
+                                        only=paste0("trait:", SNPi), 
+                                        levels=SNPlevel)
+    
+    Betas_i <- pivot_wider(predictSNPeffects$pvals, names_from = "trait", 
+                           values_from=c("predicted.value", "std.error"))
+    Cov_i <- predictSNPeffects$vcov
+    
+    #Bivariate Wald test:
+    WaldTest <- aod::wald.test(Sigma=predictSNPeffects$vcov,
+                               b=predictSNPeffects$pvals$predicted.value, Terms=1:2)
+    
+    
+    #Save results
+    all_SNP_results_df[i,] <- cbind(Betas_i, Cov_i[1,2], 
+                                    t(PSY2SNPestimates[,1]), t(PSY2SNPestimates[,2]),
+                                    t(WaldTest$result$chi), model_varcomp_i[1,1:2], 
+                                    model_varcomp_i["units:trait!trait!DM:!trait!TCICHK.cor",1:2])
+
+    rownames(all_SNP_results_df)[i] <- colnames(Betas_i)[1]
+  
+  saveRDS(all_SNP_results_df, file=paste0(project_path, 
+                          "output/mvGWAS_asreml_output/mvGWASwPSY2KASPand5PCs_unrounded_weighted_section_", 
+                           section, "_", format(Sys.time(), "%m%d"), ".RDS"))
+ 
+  cat(paste0(SNPi, ", ", i, " of ", length(section_SNPs$SNP), " in section ", section, "\n"),
+      file = paste0(project_path, "output/mvGWAS_asreml_output/progressbar/unrounded_OGBLUPs_weighted_run_071625.txt"), append=T)
+
+  } #end SNP
+
+} #end compute section
+```
+
+Run function on parallel cores
+```{r}
+library(parallel)
+DEBUG <- FALSE
+
+#Run asreml GWAS function over multiple cores:
+sections <- 1:ncores
+
+# export functions and data to cluster
+GWASfunctionvariables <- c("SNP_GWAS_PCs_function", "genomat_t", "Ginverse", "initG","BLUPs_PSY2_data", 
+                           "project_path", "ncores", "DEBUG", "nAccessions")
+  
+# create cluster object
+cl <- makeCluster(ncores)
+clusterExport(cl, varlist = GWASfunctionvariables)
+
+# test each SNP in chromosome 
+results <- parSapply(cl, sections, SNP_GWAS_PCs_function)
+
+# close cluster object
+stopCluster(cl)
+```
+
+#### Original BLUPs, re-imputed unrounded genotype data, unweighted
+Combine (unweighted) results from the parallel computation sections: 
+```{r}
+project_path <- "/workdir/ssv42/mvGWAS/"
+dataset <- "CASS"
+ncores <- 60
+lastrundate <- "0716" # may need a tryCatch if sections finished on different dates
+
+all_SNP_results_df <- data.frame()
+for (i in 1:ncores){
+  section <- i
+  print(i)
+  
+  lookupresults <- tryCatch(
+    SNPresults_i <- readRDS(file=paste0(project_path,
+               "output/mvGWAS_asreml_output/mvGWASwPSY2KASPand5PCs_unrounded_section_", 
+               section, "_", lastrundate, ".RDS")),
+    error = function(e) e)
+
+  # if(inherits(lookupresults, "error") ){
+  #   print("trying previous day")
+  #   lastrundate <- "1706"
+  #    SNPresults_i <- readRDS(file=paste0(project_path,
+  #              "output/mvGWAS_asreml_output/mvGWASwPSY2KASPand5PCs_unrounded_section_", 
+  #              section, "_", lastrundate, ".RDS"))
+  # }
+
+  all_SNP_results_df <- rbind(all_SNP_results_df, SNPresults_i)
+}
+
+# extract SNP information
+all_SNP_results_df$SNP_ID <- rownames(all_SNP_results_df)
+all_SNP_results_df$CHROM <- gsub("_[0-9].*", "",  rownames(all_SNP_results_df)) %>% gsub("S","",.)
+all_SNP_results_df$POS <- gsub("S[0-9]*_", "",  rownames(all_SNP_results_df))
+
+
+# Calculate significance of residual genetic covariance:
+#all_SNP_results_df$resid_gen_cov.z <- all_SNP_results_df$resid_gen_cov / all_SNP_results_df$resid_gen_cov.se
+#Calculate p-value from Z-score
+#all_SNP_results_df$resid_gen_cov.p <- pnorm(all_SNP_results_df$resid_gen_cov.z, lower.tail = TRUE)
+
+
+saveRDS(all_SNP_results_df, file=paste0(project_path,
+             "output/mvGWAS_asreml_output/mvGWASwPSY2KASPand5PCs_unrounded_allSNPresults_",
+             format(Sys.time(), "%m%d"), ".RDS"))
+
+```
+
+## Examine the weighted results
+Make Q-Q plots
+```{r}
+all_SNP_weighted_results_df <- readRDS(file=paste0(project_path,
+            "output/mvGWAS_asreml_output/mvGWASwPSY2KASPand5PCs_unrounded_weighted_allSNPresults_0716.RDS"))
+
+all_SNP_results_MVWald <- all_SNP_weighted_results_df
+
+png(paste0(project_path, "figures/mvGWAS_wPSY2KASPand5PCs_unroundedgenos_weighted_QQplot_CASS_",
+                    format(Sys.time(), "%m%d"), ".png"), 
+        width=6, height=6, res=250, units="in")
+ 
+qqman::qq(all_SNP_results_MVWald$P, main="Q-Q plot of weighted mvGWAS with reimputed genotypes")
+
+dev.off()
+
+# check the distribution of P-values
+ggplot(all_SNP_results_MVWald, aes( BetaSNP_TCICHK/BetaSNP_TCICHK.se, 
+                                    BetaSNP_DM/BetaSNP_DM.se, 
+                                    color=-log10(P))) +
+  ggtitle("w PSY2 covariate and PCs, weighted") +
+  geom_point()
+
+
+# check the distribution of the polygenic covariance between TC and DM -- is it still negative?
+hist(all_SNP_results_MVWald$resid_gen_cov, main="residual genetic covariance between TC/DM \nafter accounting for PSY2 and SNP, weighted", xlab="covariance estimate")
+
+range(all_SNP_results_MVWald$resid_gen_cov, na.rm=T)
+
+```
+
+Make Manhattan plot 
+```{r}
+all_SNP_results_MVWald$CHROM <- gsub("_[0-9]*","",all_SNP_results_MVWald$SNP_ID) %>% gsub("S","",.)
+all_SNP_results_Bivar <- all_SNP_results_MVWald
+
+# Set significance cut-off: Gao-modified Bonferroni
+Gao.cutoff <- 1.367e-05
+
+all_SNP_results_Bivar$POS <- as.numeric(all_SNP_results_Bivar$POS)
+MVresults_sort <- all_SNP_results_Bivar %>% arrange(as.numeric(CHROM), as.numeric(POS))
+
+#order factor levels so they display in order of chromosome
+MVresults_sort$SNP_ID <- factor(MVresults_sort$SNP_ID, levels = MVresults_sort$SNP_ID)
+MVresults_sort$CHROM <- as.factor(MVresults_sort$CHROM)
+MVresults_sort$CHROM <- factor(MVresults_sort$CHROM, levels = as.character(c(1:18)))
+
+
+#set color scheme
+colPalette <- rep(c("blue4","pink3"),9)
+
+## Plot Manhattan with bivariate Wald test p-values
+ggplot(MVresults_sort, aes(x=POS, y=-log10(P))) +
+  geom_point(aes(color=CHROM), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate, unrounded genotypes, weighted")) +
+  guides(color="none")+
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+#PSY2 v6 is 24153419 - 24156720
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_unrounded_weighted_", format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+
+#for poster:
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_unrounded_weighted_CASS_", format(Sys.time(), "%m%d_%H%M"), "_wide.jpg"), width=12, height=3)
+
+
+saveRDS(MVresults_sort, file=paste0(project_path, "output/MVresults_sorted_PSY2KASP_5PCs_revision_unroundedgenotypes_weighted.RDS"))
+
+```
+
+Color Manhattan plot by SNP covariance
+```{r}
+hist(MVresults_sort$BetaSNP_TCICHKDM.cov, main="Distribution of SNP TCICHK/DM effects covariance", xlab="SNP effect covariance")
+hist((MVresults_sort %>% filter(P < 0.001))$BetaSNP_TCICHKDM.cov, main="Distribution of top SNP TCICHK/DM effects covariance for top SNPs", xlab="SNP effect covariance")
+
+
+MVresults_sort$effectdir <- case_when(
+      MVresults_sort$P > 0.001 ~ "NA",
+      MVresults_sort$BetaSNP_TCICHK * MVresults_sort$BetaSNP_DM >= 0 ~ "same",
+      MVresults_sort$BetaSNP_TCICHK * MVresults_sort$BetaSNP_DM < 0 ~ "different")
+
+colPalette2 <- c("#00BFC4","gray", "#F8766D")
+
+## Plot Manhattan with covariance colored
+ggplot(MVresults_sort, aes(x=POS, y=-log10(P))) +
+  geom_point(aes(color=effectdir), size=0.5) +
+  scale_color_manual(values=colPalette2) +
+  #scale_color_gradient2(low = "blue", mid="gray", high = "red", midpoint = 0, name="SNP effect covariance") +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate, unrounded genotypes, weighted")) +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(aes(xintercept=0), lty="dashed", color="gray", linewidth=0.5) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+#PSY2 v6 is 24153419 - 24156720
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_revised_unrounded_weighted_weffectdir_", format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_revised_unrounded_weighted_weffectdir_", format(Sys.time(), "%m%d_%H%M"), "_wide.jpg"), width=8, height=2)
+
+
+table((MVresults_sort %>% filter(P < 0.001))$effectdir)
+
+table((MVresults_sort %>% filter(P < Gao.cutoff))$effectdir)
+
+
+## Plot Manhattan with SNP effect error covariance colored
+ggplot(MVresults_sort, aes(x=POS, y=-log10(P))) +
+  geom_point(aes(color=BetaSNP_TCICHKDM.cov), size=0.5) +
+  #scale_color_manual(values=colPalette2) +
+  scale_color_gradient2(low = "blue", mid="gray", high = "red", midpoint = 0, name="SNP effect covariance") +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate, unrounded genotypes, weighted")) +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(aes(xintercept=0), lty="dashed", color="gray", linewidth=0.5) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+
+
+## Plot Manhattan with residual (polygenic) genetic covariance colored
+ggplot(MVresults_sort, aes(x=POS, y=-log10(P))) +
+  geom_point(aes(color= resid_gen_cov), size=0.5) +
+  scale_color_manual(values=colPalette2) +
+  scale_color_gradient2(high = "blue", low="gray", mid = "lightblue", midpoint = -0.4, limits=c(-0.6,-0.19),
+                        name="residual \ngenetic \ncovariance") +
+ #scale_color_gradient(high = "blue", low="gray", name="residual polygenic covariance") +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate, unrounded genotypes, weighted")) +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  #geom_vline(aes(xintercept=0), lty="dashed", color="gray", linewidth=0.5) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+#PSY2 v6 is 24153419 - 24156720
+
+
+#note: the residual genetic covariance gets smaller (less negative) when the SNP effects the traits in different directions (i.e. the SNP is explaining some of the covariance)
+#hist((MVresults_sort %>% filter(effectdir=="same"))$TCDMgencov)
+#hist((MVresults_sort %>% filter(effectdir=="different"))$TCDMgencov)
+```
+
+SNP contribution to negative genetic covariance:
+```{r}
+BLUPs_PSY2_data <- readRDS(file=paste0(project_path, "data/BLUPs_PSY2_revised_data_0716.RDS"))
+initG <- readRDS(file=paste0(project_path, "data/initG_revisedimputation.RDS"))
+Ginverse <- readRDS(file=paste0(project_path, "data/Ginverse_revisedimputation.RDS"))
+
+#Calculate total genetic variance/covariance with no other SNPs or PSY2
+#model calculating SNP effect on each trait
+nullmodel <- asreml(data = BLUPs_PSY2_data,
+        formula(paste0("cbind(TCICHK, DM) ~ trait  + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+        residual = ~units:us(trait), weights=acc_weight, maxit=20)
+nullmodel_varcomp <- summary(nullmodel)$varcomp
+    
+nullmodel_TCICHKv <- nullmodel_varcomp["trait:vm(germplasmName, Ginverse)!trait_TCICHK", 1] +
+  nullmodel_varcomp["units:trait!trait_TCICHK:TCICHK", 1]
+nullmodel_DMv <- nullmodel_varcomp["trait:vm(germplasmName, Ginverse)!trait_DM", 1] +
+  nullmodel_varcomp["units:trait!trait_DM:DM", 1]
+nullmodel_cov <- nullmodel_varcomp["trait:vm(germplasmName, Ginverse)!trait!DM:!trait!TCICHK.cor", 1] + 
+  nullmodel_varcomp["units:trait!trait_DM:TCICHK", 1]
+
+# null model with PSY2 
+nullmodel_PSY2 <- asreml(data = BLUPs_PSY2_data,
+        formula(paste0("cbind(TCICHK, DM) ~ trait + trait:S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+        residual = ~units:us(trait), weights=acc_weight, maxit=20)
+nullmodel_PSY2_varcomp <- summary(nullmodel_PSY2)$varcomp
+
+nullmodel_PSY2_TCICHKv <- nullmodel_PSY2_varcomp["trait:vm(germplasmName, Ginverse)!trait_TCICHK", 1] + 
+  nullmodel_PSY2_varcomp["units:trait!trait_TCICHK:TCICHK", 1]
+nullmodel_PSY2_DMv <- nullmodel_PSY2_varcomp["trait:vm(germplasmName, Ginverse)!trait_DM", 1] + 
+  nullmodel_PSY2_varcomp["units:trait!trait_DM:DM", 1]
+nullmodel_PSY2_cov <- nullmodel_PSY2_varcomp["trait:vm(germplasmName, Ginverse)!trait!DM:!trait!TCICHK.cor", 1] + 
+  nullmodel_PSY2_varcomp["units:trait!trait_DM:TCICHK", 1]
+
+
+
+#difference in polygenic covariance
+# if the negative covariance goes up (more positive), then the SNP is contributing to the negative covariance
+MVresults_sort$contributiontocov <- nullmodel_gcov - MVresults_sort$resid_gen_cov
+
+## Plot Manhattan with residual (polygenic) genetic covariance colored
+ggplot(MVresults_sort, aes(x=POS, y=-log10(P))) +
+  geom_point(aes(color= contributiontocov), size=0.5) +
+  #scale_color_manual(values=colPalette2) +
+  scale_color_gradient2(high = "red", low="blue", mid = "gray", midpoint = 0.02,
+                        name="contribution to \ngenetic covariance \nbetween TC and DM") +
+ #scale_color_gradient(high = "blue", low="gray", name="residual polygenic covariance") +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate, unrounded genotypes, weighted")) +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  #geom_vline(aes(xintercept=0), lty="dashed", color="gray", linewidth=0.5) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+#PSY2 v6 is 24153419 - 24156720
+
+
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_contributiontogencov_revised_unrounded_weighted_", format(Sys.time(), "%m%d_%H%M"), "_wide.jpg"), width=12, height=3)
+```
+
+Examine LD structure around top SNPs
+```{r}
+#note: starts with MVresults_sort from chunk above
+all_SNP_results_df <- MVresults_sort
+genomat_t <- readRDS(file=paste0(project_path, "data/genomat_t_revised.RDS"))
+
+#set relaxed threshold 
+relaxed.cutoff <- 0.001
+#Meffs <- readRDS(file=paste0(project_path, "output/Meff_rev_estimates_perchr.RDS"))
+#sum(Meffs) #=594
+#old way: #relaxed.cutoff <- round(0.25/sum(Meffs),7)  #0.0004
+#print(relaxed.cutoff)
+
+all_SNP_results_df$POS <- as.numeric(all_SNP_results_df$POS)
+topSNPs <- all_SNP_results_df %>% filter(P < relaxed.cutoff) #relaxed threshold
+
+genomat_ROG <- genomat_t %>%
+   mutate(CHROM= as.integer(gsub("S", "", SNP) %>% gsub("_[0-9].*", "", .)),
+          POS= as.numeric(gsub("^S.*_", "", SNP)))
+
+#flag peaks and calculate LD -- takes a minute to run
+genomat_peaks_allchrom <- data.frame()
+for(i in 1:18) {
+  print(i)
+  genomat_peaks_i <- genomat_ROG %>% filter(CHROM == i) 
+
+  topSNPs_chri <- topSNPs %>% filter(CHROM == i) %>% arrange(P)
+  peak1 <- topSNPs_chri[1,]
+
+  #calculate LD between each SNP and the peak 1 SNP
+  if(nrow(peak1) != 0 & !is.na(peak1$SNP_ID)){
+    LDmatrix_peak1 <- genomat_peaks_i %>% dplyr::select(-c(SNP, compute_group, CHROM, POS)) %>% #drop metadata non-numeric columns
+      t() %>% cor() #calculate correlation matrix
+    LDwithpeak1 <- LDmatrix_peak1[,paste0(peak1$SNP_ID)] #pull out correlation with peak1 SNP
+    genomat_peaks_i$LDpeak1 <- LDwithpeak1
+    
+    genomat_peaks_i <- genomat_peaks_i %>% mutate(distance_peak1 = POS - peak1$POS, peak1_SNP = peak1$SNP_ID)
+  } else{genomat_peaks_i <- genomat_peaks_i %>% mutate(LDpeak1 = NA, distance_peak1 = NA, peak1_SNP = NA)}
+
+  #check if there is another peak on this chromosome and repeat if so
+  peak1_region <- c( peak1$POS - 2000000 , peak1$POS + 2000000)  
+  genomat_around_peak1 <- genomat_peaks_i %>% 
+       filter(POS > peak1_region[1] & POS < peak1_region[2])
+  
+  otherpeaks <- topSNPs_chri[!topSNPs_chri$SNP_ID %in% genomat_around_peak1$SNP,]
+  peak2 <- otherpeaks %>% arrange(P) %>% head(n=1)
+  
+  #calculate LD between each SNP and the peak 2 SNP
+  if(nrow(peak2) != 0){
+    LDmatrix_peak2 <- genomat_peaks_i %>% dplyr::select(-c(SNP, compute_group, CHROM, POS, distance_peak1, peak1_SNP)) %>% 
+      t() %>% cor()
+    LDwithpeak2 <- LDmatrix_peak2[,paste0(peak2$SNP_ID)]
+    genomat_peaks_i$LDpeak2 <- LDwithpeak2
+    
+    genomat_peaks_i <- genomat_peaks_i %>% mutate(distance_peak2 = POS - peak2$POS, peak2_SNP = peak2$SNP_ID)
+  } else{genomat_peaks_i <- genomat_peaks_i %>% mutate(LDpeak2 = NA, distance_peak2 = NA, peak2_SNP = NA)
+  } #end chromosome
+  
+  #join chromosome results with the others
+ genomat_peaks_allchrom <- rbind(genomat_peaks_allchrom, genomat_peaks_i)
+ 
+}
+
+# Examine LD decay around top SNPs
+LDdecay <- data.table::rbindlist(list(genomat_peaks_allchrom %>% dplyr::select(distance_peak1, LDpeak1),
+                 genomat_peaks_allchrom %>% dplyr::select(distance_peak2, LDpeak2)), use.names=F) %>%
+  filter(!is.na(distance_peak1)) %>%
+  mutate(Rsquared = LDpeak1^2)
+
+#Find average LD within 1 kb bins
+bins=seq(1,max(LDdecay$distance_peak1, na.rm=T), by=1000)
+my.means=rep(0, length(bins))
+LD.averages=data.frame(bins, my.means)
+for (i in 1:length(bins)) {
+    data.interval=subset(LDdecay, (LDdecay$distance_peak1 >= bins[i] & LDdecay$distance_peak1 < (bins[i]+500)))
+    LD.averages$my.means[i]=mean(data.interval$Rsquared)
+}
+plot(LD.averages$bins, LD.averages$my.means)
+plot(LD.averages$bins, LD.averages$my.means, xlim=c(0, 80000))
+
+# Visualize LD decay
+ggplot(data= LDdecay, aes(x=abs(distance_peak1), y=Rsquared)) +
+         geom_point() +
+         geom_smooth(se = FALSE, method = "loess") +
+         ggtitle("LD decay around peak SNPs") +
+         xlab("distance (bp) to peak SNP") +
+         ylab("correlation with peak SNP")
+
+ggsave(filename=paste0(project_path, "figures/asreml_mvGWAS_LDdecay_unroundedgenos_weighted_",
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"))
+
+
+# Plot Manhattan colored by LD with peak SNP
+all_SNP_results_peaks <- genomat_peaks_allchrom %>% dplyr::select(c(SNP, CHROM, POS, LDpeak1, distance_peak1, peak1_SNP, LDpeak2, distance_peak2, peak2_SNP)) %>% 
+  mutate(CHROM = as.character(CHROM)) %>%
+  mutate(distance_any = case_when(is.na(distance_peak2) | 
+                                    abs(distance_peak1) < abs(distance_peak2) ~ distance_peak1, 
+                                  TRUE ~ distance_peak2)) %>%
+ mutate(Rsquared_any = case_when(is.na(distance_peak2) | 
+                                   abs(distance_peak1) < abs(distance_peak2) ~ LDpeak1^2, 
+                                 TRUE ~ LDpeak2^2)) %>%
+  mutate(peak_SNP = case_when(SNP == peak1_SNP | SNP == peak2_SNP ~ "yes", T ~ "no")) %>%
+  left_join(all_SNP_results_df, .) %>% 
+  arrange(as.numeric(CHROM), as.numeric(POS))
+
+#order factor levels so they display in order of chromosome
+all_SNP_results_peaks$SNP <- factor(all_SNP_results_peaks$SNP, 
+                                        levels = all_SNP_results_peaks$SNP)
+all_SNP_results_peaks$CHROM <- as.factor(all_SNP_results_peaks$CHROM)
+all_SNP_results_peaks$CHROM <- factor(all_SNP_results_peaks$CHROM, 
+                                               levels = as.character(c(1:18)))
+
+saveRDS(all_SNP_results_peaks, file=paste0(project_path, "output/all_SNP_results_MVWald_wPSY2KASPand5PC2_unrounded_weighted_annotations_effdir_", format(Sys.time(), "%m%d_%H%M"), ".RDS"))
+
+
+## Plot Manhattan with joint p-values, colored by LD with peak SNP
+ggplot(all_SNP_results_peaks, aes(x=POS, y=-log10(P), color=Rsquared_any)) +
+  geom_point(aes(pch=peak_SNP, size=peak_SNP)) +
+  scale_color_gradient2(low = "blue", mid="orange", high = "red", midpoint = 0.5, 
+                          name= expression(textstyle("R"^2*" with starred SNP"))) +
+  scale_shape_manual(values = c(19,8)) +
+  scale_size_manual(values=c(0.8,1.2)) +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM, PSY2 cov, unrounded,\nweighted, with LD around peak SNPs")) +
+  guides(pch="none", size="none") +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.2) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.2, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed", lwd=0.2) #PSY2 causal SNP
+
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_revised_unrounded_weighted_wLD_", format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+
+# Color Manhattan by effect direction same/different
+colPalette2 <- c("#00BFC4","gray", "#F8766D")
+
+ggplot(all_SNP_results_peaks, aes(x=POS, y=-log10(P), color=effectdir)) +
+  geom_point(aes(pch=peak_SNP, size=peak_SNP)) +
+  scale_color_manual(values = colPalette2, name="effect direction") +
+  scale_shape_manual(values = c(19,8)) +
+  scale_size_manual(values=c(0.8,1.2)) +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM, PSY2 covariate, unrounded,\nweighted, with effect direction")) +
+  guides(pch="none", size="none") +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.2) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.2, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+   geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed", lwd=0.2) #PSY2 causal SNP
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_unrounded_weighted_wEffectDir_", 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"))
+```
+
+Binomial test and Table 2
+```{r}
+all_SNP_results_peaks <- readRDS(file=paste0(project_path, "output/all_SNP_results_MVWald_wPSY2KASPand5PC2_unrounded_weighted_annotations_effdir_0717_1703.RDS"))
+
+
+# Binomial test
+peakSNPsonly <- all_SNP_results_peaks %>% filter(peak_SNP == "yes")
+nrow(peakSNPsonly) #17, with 11 out of 17 in opposite directions
+table(peakSNPsonly$effectdir)
+binom.test(x=c(table(peakSNPsonly$effectdir)), p=0.5, alternative = "greater")
+#p-value = 0.1662
+
+
+# Reattach allele Ref/Alt information and MAF:
+genomat_SNPs <- readRDS(file="./data/genomat_rev.RDS")
+genomat_SNPinfo <- readRDS(file=paste0(project_path, "data/AllChrom_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered_SNPinfo.RDS")) %>% filter(ID %in% colnames(genomat_SNPs)) %>% rename("ID" = "SNP_ID") 
+genomat_SNPinfo$AF <- colSums(genomat_SNPs) / (nrow(genomat_SNPs)*2)
+
+
+peakSNPsonly_alleles <- left_join(peakSNPsonly, genomat_SNPinfo %>% dplyr::select(SNP_ID,ALT,REF,AF)) %>%
+  mutate(Minorallele = case_when(AF >= 0.5 ~ REF, AF < 0.5 ~ ALT),
+         Majorallele = case_when(AF >= 0.5 ~ ALT, AF < 0.5 ~ REF)) %>%
+  mutate(MAF = case_when(AF < 0.5 ~ AF, AF >= 0.5 ~ (1-AF) ))
+
+table2 <- peakSNPsonly_alleles %>% arrange(P) %>% dplyr::select(SNP_ID,P,BetaSNP_TCICHK,BetaSNP_TCICHK.se, BetaSNP_DM,BetaSNP_DM.se,effectdir,REF,ALT,AF) 
+
+# old method -- get total phenotypic variance for TCICHK and DM to calculate PVE
+#totalv_TCICHK <- var(modeldata$TCICHK, na.rm=T) #0.4393742
+#totalv_DM <- var(modeldata$DM, na.rm=T) #0.3920023
+
+table2_rounded <- table2 %>%
+  #calculate proportion variance explained (PVE)
+  mutate(PVE_TCICHK = 100*(BetaSNP_TCICHK^2 * 2 * AF * (1-AF))/ nullmodel_TCICHKv,
+         PVE_DM = 100*(BetaSNP_DM^2 * 2 * AF * (1-AF))/ nullmodel_DMv,
+        PCE_cov =  100*(BetaSNP_TCICHK * BetaSNP_DM * 2 * AF * (1-AF))/ nullmodel_cov) %>%
+  #round decimals for display in table
+  mutate(across(c(BetaSNP_TCICHK:BetaSNP_DM.se, PVE_TCICHK:PCE_cov), ~ round(.x, 3)),
+         AF = round(AF, 2)) %>%
+  mutate(P = formatC(P, format = "e", digits = 2)) %>%
+  mutate(TCeffectdir = case_when(sign(BetaSNP_TCICHK) == 1 ~ "+", sign(BetaSNP_TCICHK) == -1 ~ "-", T~NA),
+         DMeffectdir = case_when(sign(BetaSNP_DM) == 1 ~ "+", sign(BetaSNP_DM) == -1 ~ "-", T~NA)) %>%
+  mutate(EffectDirection = paste0(TCeffectdir, "/", DMeffectdir)) %>%
+  relocate(EffectDirection, .after=BetaSNP_DM.se) %>%
+  mutate(pvalue = case_when(as.numeric(P) < Gao.cutoff ~ paste0(P, " **"), 
+                             T ~ paste0(P, " *"))) %>%
+  relocate(pvalue, .after=SNP_ID)  %>%
+  dplyr::select(-c(TCeffectdir, DMeffectdir, effectdir, P))
+
+## TABLE 2
+View(table2_rounded)
+
+write.csv(table2_rounded, file=paste0(project_path, "output/table2_wPSY2KASPand5PCs_revised_unroundedgenotypes_weighted_", format(Sys.time(), "%m%d_%H%M"), ".csv"))
+
+
+#total PCE by all peak SNPs:
+sum(table2_rounded$PCE_cov)
+
+# PCE by PSY2 SNP:
+PSY2effects <- as.data.frame(summary(nullmodel_PSY2, coef=T)$coef.fixed)[c("trait_TCICHK:S1_24155522","trait_DM:S1_24155522"),1]
+PSY2AF <- sum(BLUPs_PSY2_data$S1_24155522)/(nrow(BLUPs_PSY2_data))
+
+PCE_PSY2 <- 100*((PSY2effects[1] * PSY2effects[2] * 2 * PSY2AF * (1-PSY2AF))/ nullmodel_cov)
+print(PCE_PSY2) #5.57%
+
+# PVE by  PSY2 SNP:
+PVE_TCICHK_PSY2 <- 100*(PSY2effects[1]^2 * 2 * PSY2AF * (1-PSY2AF))/ nullmodel_TCICHKv
+print(PVE_TCICHK_PSY2) #2.44%
+
+PVE_DM_PSY2 <-  100*(PSY2effects[2]^2 * 2 * PSY2AF * (1-PSY2AF))/ nullmodel_DMv
+print(PVE_DM_PSY2) #5.01%
+```
+
+Test significance of negative genetic covariance in model with PSY2 and all SNPs passing the relaxed threshold:
+```{r}
+PeakSNPsdata <- genomat_t %>%
+  filter(genomat_t$SNP %in% peakSNPsonly$SNP_ID) 
+
+rownames(PeakSNPsdata) <- PeakSNPsdata$SNP
+PeakSNPsdata_t <- as.data.frame(t(PeakSNPsdata %>% dplyr::select(-c(SNP, compute_group))))
+colnames(PeakSNPsdata_t) <- paste0(PeakSNPsdata$SNP)
+PeakSNPsdata_t$germplasmName <- rownames(PeakSNPsdata_t)
+
+modeldata <- left_join(BLUPs_PSY2_data, PeakSNPsdata_t, by="germplasmName") %>% 
+      mutate(germplasmName = as.factor(germplasmName))
+    
+    
+#fit model with all suggestively associated SNPs and PSY2 effect
+model_allpeakSNPs <- asreml(data= modeldata, 
+       fixed = formula (paste0("cbind(TCICHK, DM) ~ trait + trait:S1_24155522 + ", 
+                              paste0("PC", 1:5, collapse="+"), "+", 
+                              paste0("trait:", peakSNPsonly$SNP_ID, collapse="+")) ),
+       random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+       residual =  ~units:us(trait), weights=acc_weight, maxit=20)
+
+saveRDS(model_allpeakSNPs, file=paste0(project_path, "output/fullmodel_PSY2KASP_revised_unrounded_weighted_15peakSNPs.RDS"))
+
+
+#fix residual genetic variance parameters to 0
+model_allpeakSNPs_copy <- model_allpeakSNPs
+G_constrained <- initG
+names(G_constrained) <- c("F", "U", "U")
+G_constrained[1] <- 0
+E_constrained <- model_allpeakSNPs_copy$vparameters[5:7]
+names(E_constrained) <- c("F", "U", "U")
+E_constrained[2] <- 0
+
+
+model_allpeakSNPs_reducedmanually_startvals <- asreml(data= modeldata, 
+    fixed = formula (paste0("cbind(TCICHK, DM) ~ trait + trait:S1_24155522 + ", 
+                              paste0("PC", 1:5, collapse="+"), "+", 
+                              paste0("trait:", peakSNPsonly$SNP_ID, collapse="+")) ),
+  random = ~ corgh(trait, init=G_constrained):vm(germplasmName, Ginverse),
+  residual = ~ units:us(trait, init=E_constrained),  weights = acc_weight, 
+  maxit = 20, start.values=TRUE)
+model_allpeakSNPs_reducedmanually_startvals$R.param$`units:trait`$trait$con <- c("P","F", "P")
+
+model_allpeakSNPs_reducedmanually <- asreml(data= modeldata, 
+    fixed = formula (paste0("cbind(TCICHK, DM) ~ trait + trait:S1_24155522 + ", 
+                              paste0("PC", 1:5, collapse="+"), "+", 
+                              paste0("trait:", peakSNPsonly$SNP_ID, collapse="+")) ),
+  random = ~ corgh(trait, init=G_constrained):vm(germplasmName, Ginverse),
+  residual = ~ units:us(trait, init=E_constrained),  weights = acc_weight, 
+  maxit = 20, R.param=model_allpeakSNPs_reducedmanually_startvals$R.param)
+
+
+#fit reduced model with the 'residual' polygenic genetic covariance set to 0
+# model_allpeakSNPs_0cov <- asreml(data = modeldata, 
+#        fixed= formula (paste0("cbind(TCICHK, DM) ~ trait + trait:S1_24155522 + ", 
+#                               paste0("PC", 1:5, collapse="+"), "+", 
+#                               paste0("trait:", peakSNPsonly$SNP_ID, collapse="+"))),
+#        random = ~ diag(trait):vm(germplasmName, Ginverse),
+#        residual =  ~units:diag(trait), weights=acc_weight, maxit=20)
+
+LRTresults <- lrt.asreml(model_allpeakSNPs_reducedmanually, model_allpeakSNPs, boundary=T)
+print(LRTresults)
+saveRDS(LRTresults, file=paste0(project_path, "output/LRT_residual_gen_covar_revised_unrounded_weighted.RDS"))
+
+
+
+#LD between top SNPs:
+peakSNPscormat <- cor( modeldata %>% dplyr::select(S1_24155522, peakSNPsonly$SNP_ID) )
+peakSNPs_Rsquared <- peakSNPscormat^2
+peakSNPs_Rsquared_PSY2 <- ((as.data.frame(peakSNPscormat)$S1_24155522)[-1])^2
+max(peakSNPs_Rsquared_PSY2)
+```
+A significant likelihood ratio test here (0.002498) indicates that the model with negative residual genetic covariance is a significantly better fit than one without it. We can conclude that there is significant negative residual genetic covariance even after accounting for all of the suggestively associated SNPs.
+
+
+
+Zoom in on chromosome 1: 
+```{r, eval=F}
+#do LD calculation for all significant SNPs on chromosome 1:
+genomat_ROG <- genomat_t %>%
+  mutate(CHROM= as.integer(gsub("S", "", SNP) %>% gsub("_[0-9].*", "", .)),
+         POS= as.numeric(gsub("^S.*_", "", SNP)))
+
+genomat_peaks_1 <- genomat_ROG %>% filter(CHROM == "1")
+rownames(genomat_peaks_1) <- genomat_peaks_1$SNP
+  
+# pull out the names of any SNPs above the Gao cutoff
+topSNPs_chri <- topSNPs %>% filter(CHROM == "1") %>% arrange(P)
+num_sig_snps <- seq(1, sum(topSNPs_chri$P < Gao.cutoff))
+for(i in 1:length(num_sig_snps)){
+  assign ( paste0("peak", i), topSNPs_chri[num_sig_snps[i],] )
+}
+peak2 <- topSNPs_chri[2,]#manually add the second most significant SNP which is below Gao cutoff
+
+#calculate LD between each SNP and the peak SNPs
+snp_cor_mat <- genomat_peaks_1 %>% dplyr::select(-c(SNP, compute_group, CHROM, POS)) %>% 
+    t() %>% cor()
+
+LDwithpeak1 <- snp_cor_mat[,paste0(peak1$SNP_ID)]
+LDwithpeak2 <- snp_cor_mat[,paste0(peak2$SNP_ID)]
+
+genomat_peaks_1 <- genomat_peaks_1 %>% mutate(distance_peak1 = POS - as.numeric(peak1$POS), 
+                                              peak1_SNP = peak1$SNP_ID,
+                                              LDpeak1 = LDwithpeak1,
+                                              distance_peak2 = POS - as.numeric(peak2$POS),
+                                              peak2_SNP = peak2$SNP_ID,
+                                              LDpeak2 = LDwithpeak2,
+                                              Rsquared_peak1 = LDwithpeak1^2,
+                                              Rsquared_peak2 = LDwithpeak2^2)
+
+#Prepare to plot
+# Plot Manhattan colored by LD with peak SNP
+chr1_results_peaks <- genomat_peaks_1 %>% mutate(CHROM = as.character(CHROM)) %>%
+  mutate(isthispeak1 = case_when(SNP == peak1_SNP  ~ "yes", T ~ "no")) %>%
+  mutate(isthispeak2 = case_when(SNP == peak2_SNP  ~ "yes", T ~ "no")) %>%
+  left_join(all_SNP_results_df %>% filter(CHROM=="1"), .) %>% 
+  arrange(as.numeric(CHROM), as.numeric(POS)) %>%
+  filter(!duplicated(SNP_ID)) %>%
+  mutate(SNP = factor(SNP, levels = SNP))
+
+saveRDS(chr1_results_peaks, file=paste0(project_path, "output/chr1_results_wPSY2KASPand5PCs_revised_weighted_wpeak_annotations.RDS"))
+```
+
+```{r}
+chr1_results_peaks <- readRDS(paste0(project_path,"output/chr1_results_wPSY2KASPand5PCs_revised_weighted_wpeak_annotations.RDS"))
+
+## Plot chr 1 Manhattan with joint p-values, colored by LD with peak SNP
+ggplot(chr1_results_peaks %>% filter(POS > 20000000), aes(x=POS, y=-log10(P), color=Rsquared_peak1)) +
+  geom_point(aes(pch=isthispeak1, size=isthispeak1)) +
+  scale_color_gradient2(low = "blue", mid="orange", high = "red", midpoint = 0.5, name=
+                         expression(textstyle("R"^2*" with starred SNP"))) +
+  scale_shape_manual(values = c(19,8)) +
+  scale_size_manual(values=c(0.8,1.2)) +
+  labs(y="-log10(p)", x="Chr. 1 physical position (bp)") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate and PCs, weighted")) +
+  guides(pch="none", size="none") +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  theme(strip.background = element_rect(fill = "white")) +
+  geom_vline(aes(xintercept=24155522), color="orange", lty="dashed") + #causal PSY2 SNP 
+  annotate("segment", x = c(19400000, 19600000), xend = c(19600000, 19800000), y = c(-0.1, -0.1), yend = c(0.1, 0.1)) +
+  coord_cartesian(clip = "off", xlim = c(19000000, 35000000)) +
+  #annotate("rect", xmin = 24133741, xmax = 24170185, ymin = 0, ymax = 6, alpha = 0.2, fill="orange") #PSY2 haplotype region
+  annotate("rect", xmin = 24153419, xmax = 24156720, ymin = 0, ymax = 6, alpha = 0.2, fill="orange") #PSY2 coding region
+
+
+ggsave(filename=paste0(project_path, "figures/mvGWAS_wPSY2KASPandPCs_weighted_Chr1Manhattan_wLD_", 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"))
+
+ggsave(filename=paste0(project_path, "figures/mvGWAS_wPSY2KASPandPCs_weighted_Chr1Manhattan_wLD_", 
+                       format(Sys.time(), "%m%d_%H%M"), "_wide.jpg"), height=5, width=8, units="in")
+
+
+## Plot chr 1 Manhattan with joint p-values, colored by LD with peak 2 SNP
+ggplot(chr1_results_peaks, aes(x=POS, y=-log10(P), color=Rsquared_peak1)) +
+  geom_point(aes(pch=isthispeak1, size=isthispeak1)) +
+  scale_color_gradient2(low = "blue", mid="orange", high = "red", midpoint = 0.5, name=
+                           expression(textstyle("R"^2*" with starred SNP"))) +
+  scale_shape_manual(values = c(19,8)) +
+  scale_size_manual(values=c(0.8,1.2)) +
+  labs(y="-log10(p)", x="Chr. 1 physical position (bp)") +
+  ggtitle(paste0("MLMM GWAS for TC and DM, weighted")) +
+  guides(pch="none", size="none") +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  theme(strip.background = element_rect(fill = "white"))  +
+  geom_vline(aes(xintercept=24155522), color="orange", lty="dashed")
+
+ggsave(filename=paste0(project_path, "figures/mvGWAS_wPSY2KASPandPCs_weighted_Chr1Manhattan_wLD_pk2_", 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"))
+
+ggsave(filename=paste0(project_path, "figures/mvGWAS_wPSY2KASPandPCs_weighted_Chr1Manhattan_wLD_pk2_", 
+                       format(Sys.time(), "%m%d_%H%M"), "_wide.jpg"), height=4, width=6, units="in")
+
+
+```
+
+
+Test LD of chr 1 peak SNP with PSY2:
+```{r}
+genomat_chr1qtl <- genomat_plusPSY %>% filter(SNP == "S1_24155522" | SNP == "S1_23484417") %>%
+  column_to_rownames("SNP") %>%
+  dplyr::select(-c(CHROM, POS))
+
+LDchr1 <- cor(t(genomat_chr1qtl))
+(LDchr1[1,2])^2
+```
+
+
+Test LD of all bivariate peak SNPs with each other:
+```{r}
+topSNPs_LD <- (cor(t(genomat_topSNPs)))^2
+diag(topSNPs_LD) <- NA
+
+topSNPs_LD_vector <- topSNPs_LD[lower.tri(topSNPs_LD, diag=F)]
+topSNPs_LD_vector[which.max(topSNPs_LD_vector)] # 0.095
+```
+
+
+
+
+# Model comparison --
+```{r}
+# Compare association models: bivariate (1), univariate with other trait covariate (2 & 3), and univariate (4a & 4b)
+ 
+#get top SNP info
+alltopSNPlist <- peakSNPsonly$SNP
+topSNPs <- all_SNP_results_MVWald %>% filter(SNP_ID %in% alltopSNPlist)
+genomat_topSNPs <- genomat_ROG %>% filter(SNP %in% alltopSNPlist) %>%
+  dplyr::select(-c(SNP, compute_group, CHROM, POS))
+
+
+# Loop across all top SNPs 
+# initiate storage
+model_storage <- list()
+model_comparison_allSNPs <- list()
+  
+for(i in 1:nrow(genomat_topSNPs)){
+  print(i)
+    
+  SNPi <- rownames(genomat_topSNPs)[i]
+  SNPidata <- as.data.frame(t(genomat_topSNPs[i, ]))
+  colnames(SNPidata) <- paste0(SNPi)
+  SNPidata$germplasmName <- rownames(SNPidata)
+  
+  modeldata <- left_join(BLUPs_PSY2_data, SNPidata, by="germplasmName") %>% 
+      mutate(germplasmName = as.factor(germplasmName)) %>%
+      filter(!is.na(TCICHK) & !is.na(DM))
+
+  
+  #model 1: SNP is jointly associated with bivariate phenotype
+  SNPimodel1 <- asreml(data = modeldata,
+        fixed = formula(paste0("cbind(TCICHK, DM) ~ trait + trait:", SNPi, 
+                               " + trait:S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+        residual = ~units:us(trait), weights=acc_weight, maxit=30, trace=F)
+  
+   #predict SNP effects
+    SNPlevel <- list(1)
+    names(SNPlevel) <- SNPi
+    predictSNPeffects1 <- predict.asreml(SNPimodel1, vcov=T, 
+                                        classify=paste0("trait:", SNPi), 
+                                        only=paste0("trait:", SNPi), 
+                                        levels=SNPlevel)
+    
+    Betas_i <- pivot_wider(predictSNPeffects1$pvals, names_from = "trait", 
+                           values_from=c("predicted.value", "std.error"))
+    Cov_i <- predictSNPeffects1$vcov
+    
+    #Bivariate Wald test:
+    WaldTest1bv <- aod::wald.test(Sigma=predictSNPeffects1$vcov,
+                               b=predictSNPeffects1$pvals$predicted.value, Terms=1:2)
+    
+  
+  WaldTest1 <- as.data.frame(wald.asreml(SNPimodel1))
+  WaldTest1$AIC <- summary(SNPimodel1)$aic
+  WaldTest1$BIC <- summary(SNPimodel1)$bic
+  WaldTest1$bvP <- WaldTest1bv$result$chi2["P"]
+  WaldTest1$loglik <- summary(SNPimodel1)$loglik
+
+  
+  #model 2: SNP is associated with TC while accounting for DM
+  SNPimodel2 <- asreml(data = modeldata,
+        fixed = formula(paste0("TCICHK ~ 1 + DM*", SNPi, " + S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ vm(germplasmName, Ginverse),
+        residual = ~units, weights=TCICHK_weight, maxit=20, trace=F)
+  
+  WaldTest2 <- as.data.frame(wald.asreml(SNPimodel2))
+  WaldTest2$AIC <- summary(SNPimodel2)$aic
+  WaldTest2$BIC <- summary(SNPimodel2)$bic
+  WaldTest2$loglik <- summary(SNPimodel2)$loglik
+    
+  
+  #model 3: SNP is associated with DM while accounting for TC
+  SNPimodel3 <- asreml(data = modeldata,
+        fixed = formula(paste0("DM ~ 1 + TCICHK*", SNPi, " + S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ vm(germplasmName, Ginverse),
+        residual = ~units, weights=DM_weight, maxit=20, trace=F)
+  
+  WaldTest3 <- as.data.frame(wald.asreml(SNPimodel3))
+  WaldTest3$AIC <- summary(SNPimodel3)$aic
+  WaldTest3$BIC <- summary(SNPimodel3)$bic
+  WaldTest3$loglik <- summary(SNPimodel3)$loglik
+
+  
+  #model 4a: SNP is associated with TC (univariate)
+  SNPimodel4a <- asreml(data = modeldata,
+        fixed = formula(paste0("TCICHK ~ 1 + ", SNPi, "+ S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ vm(germplasmName, Ginverse),
+        residual = ~units, weights=TCICHK_weight, maxit=20, trace=F)
+  WaldTest4a <- as.data.frame(wald.asreml(SNPimodel4a))
+  WaldTest4a$AIC <- summary(SNPimodel4a)$aic
+  WaldTest4a$BIC <- summary(SNPimodel4a)$bic
+  WaldTest4a$loglik <- summary(SNPimodel4a)$loglik
+
+  
+  #model 4b: SNP is associated with DM (univariate)
+  SNPimodel4b <- asreml(data = modeldata,
+        fixed = formula(paste0("DM ~ 1 + ", SNPi, " + S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ vm(germplasmName, Ginverse),
+        residual = ~units, weights = DM_weight, maxit=20, trace=F)
+  WaldTest4b <- as.data.frame(wald.asreml(SNPimodel4b))
+  WaldTest4b$AIC <- summary(SNPimodel4b)$aic
+  WaldTest4b$BIC <- summary(SNPimodel4b)$bic
+  WaldTest4b$loglik <- summary(SNPimodel4b)$loglik
+
+  # Save results from this SNP:
+   model_stats_storage_i <- list(WaldTest1, WaldTest2, WaldTest3, WaldTest4a, WaldTest4b)
+     
+   model_comparison_allSNPs[[i]] <- model_stats_storage_i
+
+} #end SNP
+  
+
+saveRDS(model_comparison_allSNPs, file=paste0(project_path, 
+                  "output/mvGWAS_asreml_output/topSNP_model_comparison_Waldstats_wPSY2KASP_5PCs_revised_weighted_", format(Sys.time(), "%m%d"), ".RDS"))
+```
+
+Evaluate model comparison for peak SNPs
+```{r}
+lastrundate <- "0720"
+model_comparison_allSNPs <- readRDS(file=paste0(project_path,
+                  "output/mvGWAS_asreml_output/topSNP_model_comparison_Waldstats_wPSY2KASP_5PCs_revised_weighted_", lastrundate, ".RDS"))
+
+#model 1: bivariate; model 2: TCICHK with DM covariate, model 3: TCICHK with DM covariate, model 4a: univariate TCICHK, model 4b: univariate DM
+
+modelcomp_summary_table <- data.frame()
+for(i in 1:nrow(genomat_topSNPs)){
+  SNPname <- rownames(genomat_topSNPs)[i]
+
+  mod1 <- model_comparison_allSNPs[[i]][[1]][paste0("trait:",SNPname),c("Pr(Chisq)", "AIC", "BIC", "loglik")]
+  colnames(mod1) <- paste0("1_", colnames(mod1))
+  
+  mod2 <- model_comparison_allSNPs[[i]][[2]][SNPname,c("Pr(Chisq)", "AIC", "BIC", "loglik")]
+  colnames(mod2) <- paste0("2_", colnames(mod2))
+  
+  mod3 <- model_comparison_allSNPs[[i]][[3]][SNPname,c("Pr(Chisq)", "AIC", "BIC", "loglik")]
+  colnames(mod3) <- paste0("3_", colnames(mod3))
+  
+  mod4a <- model_comparison_allSNPs[[i]][[4]][SNPname,c("Pr(Chisq)", "AIC", "BIC", "loglik")]
+  colnames(mod4a) <- paste0("4a_", colnames(mod4a))
+  
+  mod4b <- model_comparison_allSNPs[[i]][[5]][SNPname,c("Pr(Chisq)", "AIC", "BIC", "loglik")]
+  colnames(mod4b) <- paste0("4b_", colnames(mod4b))
+  
+
+AICcomp <- c(mod1$`1_AIC`,mod2$`2_AIC`,mod3$`3_AIC`,mod4a$`4a_AIC`, mod4b$`4b_AIC`)
+#BICcomp <- c(mod1$`1_BIC`,mod2$`2_BIC`,mod3$`3_BIC`,mod4a$`4a_BIC`, mod4b$`4b_BIC`)
+Pcomp <- c(mod1$`1_Pr(Chisq)`,mod2$`2_Pr(Chisq)`,mod3$`3_Pr(Chisq)`) #mod4a$`4a_Pr(Chisq)`, mod4b$`4b_Pr(Chisq)`)
+loglikcomp <- c(mod1$`1_loglik`, mod2$`2_loglik`, mod3$`3_loglik`, mod4a$`4a_loglik`, mod4b$`4b_loglik`)
+
+
+tosave <- cbind(mod1, mod2, mod3, mod4a, mod4b)
+tosave$lowestAICmod <- which.min(AICcomp)
+#tosave$lowestBICmod <- which.min(BICcomp)
+tosave$lowestP <- which.min(Pcomp)
+tosave$highestloglik <- which.max(loglikcomp)
+
+rownames(tosave) <- gsub("trait:", "", rownames(tosave))
+modelcomp_summary_table <- rbind(modelcomp_summary_table, tosave)
+}
+
+View(modelcomp_summary_table)
+
+#format for table 3:
+table3 <- data.frame(PeakSNP = gsub("S","",rownames(modelcomp_summary_table)), 
+           BivariateAIC = round(modelcomp_summary_table$`1_AIC`, 2),
+           TC_AIC = round(modelcomp_summary_table$`2_AIC`, 2),
+           DM_AIC = round(modelcomp_summary_table$`3_AIC`, 2),
+           #Bivariateloglik = modelcomp_summary_table$`1_loglik`, 
+           #TC_loglik = modelcomp_summary_table$`2_loglik`, 
+           #DM_loglik = modelcomp_summary_table$`3_loglik`,
+           BivariateP = modelcomp_summary_table$`1_Pr(Chisq)`,
+           TC_P = modelcomp_summary_table$`2_Pr(Chisq)`,
+           DM_P = modelcomp_summary_table$`3_Pr(Chisq)`)
+
+
+table3_formatted <- table3 %>% arrange(BivariateP) %>%
+  mutate(BivariateP = case_when(as.numeric(BivariateP) < Gao.cutoff ~ 
+                                  paste0(formatC(BivariateP, format="e", digits=2), " **"),
+                                as.numeric(BivariateP) < relaxed.cutoff ~ 
+                                  paste0(formatC(BivariateP, format="e", digits=2),  " *"),
+                             T ~ paste0(formatC(BivariateP, format="e", digits=2))) ) %>%
+  mutate(TC_P = case_when(as.numeric(TC_P) < Gao.cutoff ~ 
+                                  paste0(formatC(TC_P, format="e", digits=2), " **"),
+                                as.numeric(TC_P) < relaxed.cutoff ~ 
+                                  paste0(formatC(TC_P, format="e", digits=2),  " *"),
+                             T ~ paste0(formatC(TC_P, format="e", digits=2))) ) %>%
+  mutate(DM_P = case_when(as.numeric(DM_P) < Gao.cutoff ~ 
+                                  paste0(formatC(DM_P, format="e", digits=2), " **"),
+                                as.numeric(DM_P) < relaxed.cutoff ~ 
+                                  paste0(formatC(DM_P, format="e", digits=2),  " *"),
+                             T ~ paste0(formatC(DM_P, format="e", digits=2))) )
+
+View(table3_formatted)
+
+
+table3 %>% rmarkdown::paged_table()
+write.csv(table3_formatted, file="/workdir/ssv42/mvGWAS/output/table3_modelcomparison_wPSY2SNP_5PCs_revised_weighted.csv")
+
+```
+Note: I am using the bivariate p-value from the original GWAS model, which is slightly different than the one listed here, because this analysis required me to subset the data to remove any observations with missing DM or TCICHK data, which are necessary for the respective univariate models but not needed in the bivariate model.
+
+
+
+
+
+
+Get effect estimates using mixed model fit on untransformed phenotype BLUPs
+```{r}
+#Get drgBLUPs from untransformed phenotypes:
+OGBLUPs <- readRDS(file=paste0(project_path, "data/untransformed_OGphenos_TCICHK_DM_BLUPs.RDS"))
+
+# join OGpheno BLUPs with rest of data
+OGBLUPs_PSY2_data <- left_join(BLUPs_PSY2_data, OGBLUPs, by=c("germplasmName")) 
+
+
+
+##Re-run bivariate mixed model with OGBLUPs for each of the top SNPs
+genomat_topSNPs <- genomat_SNPs %>% filter(SNP %in% topSNPs$SNP_ID) %>%
+  dplyr::select(-c(SNP, compute_group, CHROM, POS))
+
+OGBLUPs_topSNP_results_df <- data.frame()
+
+for(i in 1:nrow(genomat_topSNPs)){
+ 
+  SNPi <- rownames(genomat_topSNPs)[i];  print(SNPi)
+  SNPidata <- as.data.frame(t(genomat_topSNPs[i,]))
+  colnames(SNPidata) <- paste0(SNPi)
+  SNPidata$germplasmName <- rownames(SNPidata)
+  
+  modeldata <- left_join(OGBLUPs_PSY2_data, SNPidata, by=c("germplasmName")) %>%
+    mutate(germplasmName = as.factor(germplasmName))
+
+OGpheno_biv_model <- asreml(data = modeldata,
+        fixed = formula(paste0("cbind(TCICHK_OG, DM_OG) ~ trait + trait:", SNPi, 
+                               " + trait:S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+        residual = ~units:us(trait), weights=acc_weight, maxit=30, trace=F)
+  
+   #predict SNP effects
+    SNPlevel <- list(1)
+    names(SNPlevel) <- SNPi
+    predictSNPeffects1 <- predict.asreml(OGpheno_biv_model, vcov=T, 
+                                        classify=paste0("trait:", SNPi), 
+                                        only=paste0("trait:", SNPi), 
+                                        levels=SNPlevel)
+    
+    Betas_i <- pivot_wider(predictSNPeffects1$pvals, names_from = "trait", 
+                           values_from=c("predicted.value", "std.error"))
+    Cov_i <- predictSNPeffects1$vcov
+    
+    #Bivariate Wald test:
+    WaldTest1bv <- aod::wald.test(Sigma=predictSNPeffects1$vcov,
+                               b=predictSNPeffects1$pvals$predicted.value, Terms=1:2)
+    
+    #Store results
+    #Save results
+    OGBLUPs_topSNP_results_df[i,1:10] <- cbind(Betas_i, Cov_i[1,2], t(WaldTest1bv$result$chi))
+
+    rownames(OGBLUPs_topSNP_results_df)[i] <- colnames(Betas_i)[1]
+    
+    
+}
+OGBLUPs_topSNP_results_df$SNP_ID <- rownames(OGBLUPs_topSNP_results_df)
+
+
+  
+saveRDS(OGBLUPs_topSNP_results_df, file=paste0(project_path, 
+          "output/mvGWAS_asreml_output/mvGWASwPSY2KASPand5PCs_betaestimates_untransformedphenos_revised_unrounded_weighted_",  format(Sys.time(), "%m%d"), ".RDS"))
+
+
+
+table2_expanded <- left_join(table2_rounded, OGBLUPs_topSNP_results_df, by=c("SNP_ID")) 
+
+betaSNP_comparison <- table2_expanded %>% dplyr::select(SNP_ID, BetaSNP_TCICHK, predicted.value_TCICHK_OG, BetaSNP_DM, predicted.value_DM_OG, pvalue, P)
+colnames(betaSNP_comparison) <- c("SNP","BoxCox_Beta_TCICHK","Original_Beta_TCICHK","BoxCox_Beta_DM","Original_Beta_DM", "P_trans", "P_OG")
+
+
+View(betaSNP_comparison)
+
+# plot(betaSNP_comparison$BoxCox_Beta_TCICHK, betaSNP_comparison$Original_Beta_TCICHK,
+#      xlab="Box-Cox transformed SNP effect estimate", 
+#      ylab="Untransformed data SNP effect estimate", 
+#      main="TCICHK")
+# 
+# plot(betaSNP_comparison$BoxCox_Beta_DM, betaSNP_comparison$Original_Beta_DM,
+#      xlab="Box-Cox transformed SNP effect estimate", 
+#      ylab="Untransformed data SNP effect estimate", 
+#      main="DM")
+
+# Compare effect estimates from Box-Cox transformed data to estimates from untransformed data
+TCBoxCoxmod <- lm(betaSNP_comparison$Original_Beta_TCICHK ~ betaSNP_comparison$BoxCox_Beta_TCICHK)
+TCBoxCoxmod$coefficients
+summary(TCBoxCoxmod)$r.squared
+
+DMBoxCoxmod <- lm(betaSNP_comparison$Original_Beta_DM ~ betaSNP_comparison$BoxCox_Beta_DM)
+DMBoxCoxmod$coefficients
+summary(DMBoxCoxmod)$r.squared
+
+
+ggplot(betaSNP_comparison, aes(BoxCox_Beta_TCICHK, Original_Beta_TCICHK)) +
+  geom_point(aes(color="TCICHK")) +
+  geom_point(aes(BoxCox_Beta_DM, Original_Beta_DM, color="DM")) +
+  geom_abline(intercept= TCBoxCoxmod$coefficients[1], slope=TCBoxCoxmod$coefficients[2], color ="#F5793A") +
+  geom_abline(intercept= DMBoxCoxmod$coefficients[1], slope=DMBoxCoxmod$coefficients[2], color ="#0F2080") +
+  xlab("SNP effect estimate from Box-Cox transformed data") +
+  ylab("SNP effect estimate from untransformed data") +
+  scale_color_manual(values = c("TCICHK" = "#F5793A", "DM" = "#0F2080"),
+                     labels = c( expression("DM (%)"), expression("TCICHK ("*mu*"g/g) fresh weight") )) +
+  guides(color = guide_legend("Trait")) +
+  theme(legend.text = element_text(hjust = 0))
+  
+
+ggsave(file=paste0(project_path, "figures/BoxCox_untransformed_effect_estimate_revised_weighted_comparison.png"))
+  
+  
+
+range(betaSNP_comparison$Original_Beta_TCICHK)
+range(betaSNP_comparison$Original_Beta_DM)
+
+
+#Effect estimates of top SNPs on regular scale:
+betaSNP_comparison %>% filter(SNP =="S1_23484417")
+betaSNP_comparison %>% filter(SNP == "S10_2963170")
+```
+
+Allele frequency and effect sizes:
+Boxplots:
+```{r}
+#Read in original (transformed) phenotype data -- just take mean for each accession
+OGPhenos <- readRDS(file=paste0(project_path, "data/trialdata_subset_CASS_TCICHK_H2filterTRUE.RDS")) %>%
+  group_by(germplasmName) %>%
+  summarise(meanTCICHK = mean(TCICHK, na.rm=T), meanDM = mean(DM, na.rm=T)) %>%
+  filter(!is.na(meanTCICHK))
+
+# Plot boxplots to visualize peak SNP effects on raw phenotypes
+GaopeakSNPs <- c("S1_24155522", "S1_23484417", "S10_2963170")
+GaopeakSNPsdata <- as.data.frame(t(genomat_topSNPs[GaopeakSNPs,]))
+GaopeakSNPsdata$germplasmName <- rownames(GaopeakSNPsdata)
+  
+boxplotdata <- left_join(OGBLUPs_PSY2_data, GaopeakSNPsdata, by=c("germplasmName")) %>%
+  left_join(OGPhenos, by="germplasmName") %>%
+  mutate(germplasmName = as.factor(germplasmName))
+  
+for(i in 1:length(GaopeakSNPs)){
+  SNPi <- GaopeakSNPs[i]
+  
+  CombinedBoxplot_i <- ggplot(boxplotdata) + 
+    geom_boxplot(aes(x=as.factor(round(.data[[SNPi]])), y=meanTCICHK), color="orange", alpha=0.7) +
+    geom_boxplot(aes(x=as.factor(round(.data[[SNPi]])), y=meanDM), color="blue", alpha=0.7) +
+      xlab(paste0(SNPi)) +
+      ggtitle(paste0(SNPi, " effects on TCICHK and DM")) +
+      #ylab("mean TCICHIK (ug/g) / mean DM (%)") +
+      theme(axis.title.y = element_blank(),
+            plot.margin = margin(10, 10, 10, 70)) +
+      coord_cartesian(clip = 'off') +
+      annotate("text", x = 0, y = 44, label = "DM (%)", 
+             color = "blue", angle = 90, hjust = 1.5, vjust=-2.5, size = 5) +
+      annotate("text", x = 0, y = 35, label = bquote("TCICHK (" * mu * "g/g)"), 
+             color = "orange", angle = 90, hjust = 1.5, vjust=-1.8, size = 5)
+  
+  ggsave(CombinedBoxplot_i, file=paste0(project_path, "figures/boxplot_revised_roundedgenos_", SNPi, ".png"), height=5, width=7, units="in")
+  
+  print(CombinedBoxplot_i)
+  
+  
+  dotplot_i <- ggplot(boxplotdata, aes(x=TCICHK, y=DM, color=as.factor(round(.data[[SNPi]])))) +
+    geom_point() +
+    scale_color_discrete( name = SNPi )
+  
+   ggsave(dotplot_i, file=paste0(project_path, "figures/dotplot_revised_roundedgenos_", SNPi, ".png"), height=5, width=7, units="in")
+   print(dotplot_i)
+}
+
+
+ggplot(boxplotdata, aes(x=TCICHK, y=DM, color=as.factor(round(S10_2963170)))) +
+    geom_point() +
+    scale_color_discrete( name = "S10_2963170", labels = c("AA", "AC", "CC"))
+  
+ggsave(file=paste0(project_path, "figures/dotplot_revised_roundedgenos_allelelabeled_S10_2963170.png"), height=5, width=7, units="in")
+
+
+ggplot(boxplotdata, aes(x=TCICHK, y=DM, color=as.factor(round(S1_23484417)))) +
+    geom_point() +
+    scale_color_discrete( name = "S1_23484417", labels = c("CC", "CG", "GG"))
+  
+ggsave(file=paste0(project_path, "figures/dotplot_revised_roundedgenos_allelelabeled_S1_23484417.png"), height=5, width=7, units="in")
+
+
+ggplot(boxplotdata, aes(x=TCICHK, y=DM, color=as.factor(round(S1_24155522)))) +
+    geom_point() +
+    scale_color_discrete( name = "S1_24155522", labels = c("CC", "CA", "AA"))
+  
+ggsave(file=paste0(project_path, "figures/dotplot_revised_roundedgenos_allelelabeled_S1_24155522.png"), height=5, width=7, units="in")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#########################
+OLD code below:
+#########################
+
+## Examine the unweighted results
+Make Q-Q plots
+```{r}
+all_SNP_results_df <- readRDS(file=paste0(project_path,
+            "output/mvGWAS_asreml_output/mvGWASwPSY2KASPand5PCs_unrounded_allSNPresults_0716.RDS"))
+
+all_SNP_results_MVWald <- all_SNP_results_df
+
+png(paste0(project_path, "figures/mvGWAS_wPSY2KASPand5PCs_unroundedgenos_QQplot_", dataset, "_",
+                    format(Sys.time(), "%m%d"), ".png"), 
+        width=6, height=6, res=250, units="in")
+ 
+qqman::qq(all_SNP_results_MVWald$P, main="Q-Q plot of mvGWAS with reimputed genotypes")
+
+dev.off()
+
+# check the distribution of P-values
+ggplot(all_SNP_results_MVWald, aes( BetaSNP_TCICHK/BetaSNP_TCICHK.se, 
+                                    BetaSNP_DM/BetaSNP_DM.se, 
+                                    color=-log10(P))) +
+  ggtitle("w PSY2 covariate and PCs") +
+  geom_point()
+
+
+# check the distribution of the polygenic covariance between TC and DM -- is it still negative?
+hist(all_SNP_results_MVWald$resid_gen_cov, main="residual genetic covariance between TC/DM \nafter accounting for PSY2 and SNP", xlab="covariance estimate")
+
+range(all_SNP_results_MVWald$resid_gen_cov, na.rm=T)
+
+```
+
+
+Make Manhattan plot 
+```{r}
+all_SNP_results_MVWald$CHROM <- gsub("_[0-9]*","",all_SNP_results_MVWald$SNP_ID) %>% gsub("S","",.)
+all_SNP_results_Bivar <- all_SNP_results_MVWald
+
+# Set significance cut-off: Gao-modified Bonferroni
+Gao.cutoff <- 1.367e-05
+
+all_SNP_results_Bivar$POS <- as.numeric(all_SNP_results_Bivar$POS)
+MVresults_sort <- all_SNP_results_Bivar %>% arrange(as.numeric(CHROM), as.numeric(POS))
+
+#order factor levels so they display in order of chromosome
+MVresults_sort$SNP_ID <- factor(MVresults_sort$SNP_ID, levels = MVresults_sort$SNP_ID)
+MVresults_sort$CHROM <- as.factor(MVresults_sort$CHROM)
+MVresults_sort$CHROM <- factor(MVresults_sort$CHROM, levels = as.character(c(1:18)))
+
+
+#set color scheme
+colPalette <- rep(c("blue4","pink3"),9)
+
+## Plot Manhattan with bivariate Wald test p-values
+ggplot(MVresults_sort, aes(x=POS, y=-log10(P))) +
+  geom_point(aes(color=CHROM), size=0.5) +
+  scale_color_manual(values=colPalette) +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate and unrounded genotypes")) +
+  guides(color="none")+
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(legend.position = "none",
+          strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+#PSY2 v6 is 24153419 - 24156720
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_unrounded_", format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+
+#for poster:
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_unrounded_", dataset, "_", format(Sys.time(), "%m%d_%H%M"), "_wide.jpg"), width=12, height=3)
+
+
+saveRDS(MVresults_sort, file=paste0(project_path, "output/MVresults_sorted_PSY2KASP_5PCs_revision_unroundedgenotypes.RDS"))
+
+```
+
+Color Manhattan plot by SNP covariance
+```{r}
+hist(MVresults_sort$BetaSNP_TCICHKDM.cov, main="Distribution of SNP TCICHK/DM effects covariance", xlab="SNP effect covariance")
+hist((MVresults_sort %>% filter(P < 0.001))$BetaSNP_TCICHKDM.cov, main="Distribution of top SNP TCICHK/DM effects covariance for top SNPs", xlab="SNP effect covariance")
+
+
+MVresults_sort$effectdir <- case_when(
+      MVresults_sort$P > 0.001 ~ "NA",
+      MVresults_sort$BetaSNP_TCICHK * MVresults_sort$BetaSNP_DM >= 0 ~ "same",
+      MVresults_sort$BetaSNP_TCICHK * MVresults_sort$BetaSNP_DM < 0 ~ "different")
+
+colPalette2 <- c("#00BFC4","gray", "#F8766D")
+
+## Plot Manhattan with covariance colored
+ggplot(MVresults_sort, aes(x=POS, y=-log10(P))) +
+  geom_point(aes(color=effectdir), size=0.5) +
+  scale_color_manual(values=colPalette2) +
+  #scale_color_gradient2(low = "blue", mid="gray", high = "red", midpoint = 0, name="SNP effect covariance") +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate, unrounded genotypes")) +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(aes(xintercept=0), lty="dashed", color="gray", linewidth=0.5) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+#PSY2 v6 is 24153419 - 24156720
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_revised_unrounded_weffectdir_", format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_revised_unrounded_weffectdir_", format(Sys.time(), "%m%d_%H%M"), "_wide.jpg"), width=8, height=2)
+
+
+table((MVresults_sort %>% filter(P < 0.001))$effectdir)
+
+table((MVresults_sort %>% filter(P < Gao.cutoff))$effectdir)
+
+
+## Plot Manhattan with SNP effect error covariance colored
+ggplot(MVresults_sort, aes(x=POS, y=-log10(P))) +
+  geom_point(aes(color=BetaSNP_TCICHKDM.cov), size=0.5) +
+  #scale_color_manual(values=colPalette2) +
+  scale_color_gradient2(low = "blue", mid="gray", high = "red", midpoint = 0, name="SNP effect covariance") +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate, unrounded genotypes")) +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(aes(xintercept=0), lty="dashed", color="gray", linewidth=0.5) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+
+
+## Plot Manhattan with residual (polygenic) genetic covariance colored
+ggplot(MVresults_sort, aes(x=POS, y=-log10(P))) +
+  geom_point(aes(color= resid_gen_cov), size=0.5) +
+  scale_color_manual(values=colPalette2) +
+  scale_color_gradient2(high = "blue", low="gray", mid = "lightblue", midpoint = -0.4, limits=c(-0.6,-0.19),
+                        name="residual \ngenetic \ncovariance") +
+ #scale_color_gradient(high = "blue", low="gray", name="residual polygenic covariance") +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate, unrounded genotypes")) +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  #geom_vline(aes(xintercept=0), lty="dashed", color="gray", linewidth=0.5) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+#PSY2 v6 is 24153419 - 24156720
+
+
+#note: the residual genetic covariance gets smaller (less negative) when the SNP effects the traits in different directions (i.e. the SNP is explaining some of the covariance)
+#hist((MVresults_sort %>% filter(effectdir=="same"))$TCDMgencov)
+#hist((MVresults_sort %>% filter(effectdir=="different"))$TCDMgencov)
+```
+
+SNP contribution to negative genetic covariance:
+```{r}
+#BLUPs_hap_data <- readRDS(file=paste0(project_path, "data/BLUPs_hap_data_0826.RDS")) %>%
+#  mutate(S1_24155522_dom = ifelse(S1_24155522 == 1, 1, 0))
+#initG <- readRDS( file=paste0(project_path, "output/initG_traitgenvar_0826.RDS"))
+
+#negative genetic covariance with no other SNPs or PSY2
+    #model calculating SNP effect on each trait
+   nullmodel <- asreml(data = BLUPs_PSY2_data,
+        formula(paste0("cbind(TCICHK, DM) ~ trait  + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+        residual = ~units:corgh(trait), maxit=20)
+   nullmodel_varcomp <- summary(nullmodel)$varcomp
+    
+nullmodel_TCICHKv <- nullmodel_varcomp["trait:vm(germplasmName, Ginverse)!trait_TCICHK", 1] + nullmodel_varcomp["units:trait!trait_TCICHK", 1]
+nullmodel_DMv <- nullmodel_varcomp["trait:vm(germplasmName, Ginverse)!trait_DM", 1] + nullmodel_varcomp["units:trait!trait_DM", 1]
+nullmodel_cov <- nullmodel_varcomp["trait:vm(germplasmName, Ginverse)!trait!DM:!trait!TCICHK.cor", 1] + nullmodel_varcomp["units:trait!trait!DM:!trait!TCICHK.cor", 1]
+nullmodel_gcov <- nullmodel_varcomp["trait:vm(germplasmName, Ginverse)!trait!DM:!trait!TCICHK.cor", 1]
+
+
+# null model with PSY2 
+nullmodel_PSY2 <- asreml(data = BLUPs_PSY2_data,
+        formula(paste0("cbind(TCICHK, DM) ~ trait + trait:S1_24155522 + PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+        residual = ~units:corgh(trait), maxit=20)
+nullmodel_PSY2_varcomp <- summary(nullmodel_PSY2)$varcomp
+
+nullmodel_PSY2_TCICHKv <- nullmodel_PSY2_varcomp["trait:vm(germplasmName, Ginverse)!trait_TCICHK", 1] + nullmodel_PSY2_varcomp["units:trait!trait_TCICHK", 1]
+nullmodel_PSY2_DMv <- nullmodel_PSY2_varcomp["trait:vm(germplasmName, Ginverse)!trait_DM", 1] + nullmodel_PSY2_varcomp["units:trait!trait_DM", 1]
+nullmodel_PSY2_cov <- nullmodel_PSY2_varcomp["trait:vm(germplasmName, Ginverse)!trait!DM:!trait!TCICHK.cor", 1] + nullmodel_PSY2_varcomp["units:trait!trait!DM:!trait!TCICHK.cor", 1]
+
+#calculate AF of PSY2 allele:
+# PSY2_imputed_rev <- readRDS(file="./data/PSY2KASP_revimputed_unrounded.RDS")
+# PSY2_AF <- sum(PSY2_imputed_rev$S1_24155522)/(nrow(PSY2_imputed_rev)*2)
+# 
+
+
+
+
+#difference in polygenic covariance
+# if the negative covariance goes up (more positive), then the SNP is contributing to the negative covariance
+MVresults_sort$contributiontocov <- nullmodel_gcov - MVresults_sort$resid_gen_cov
+
+## Plot Manhattan with residual (polygenic) genetic covariance colored
+ggplot(MVresults_sort, aes(x=POS, y=-log10(P))) +
+  geom_point(aes(color= contributiontocov), size=0.5) +
+  #scale_color_manual(values=colPalette2) +
+  scale_color_gradient2(high = "red", low="blue", mid = "gray", midpoint = 0.02,
+                        name="contribution to \ngenetic covariance \nbetween TC and DM") +
+ #scale_color_gradient(high = "blue", low="gray", name="residual polygenic covariance") +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM with PSY2 covariate, unrounded genotypes")) +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.4) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.4, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  #geom_vline(aes(xintercept=0), lty="dashed", color="gray", linewidth=0.5) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed") #PSY2 causal SNP
+#PSY2 v6 is 24153419 - 24156720
+
+
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_contributiontogencov_revised_unrounded_", format(Sys.time(), "%m%d_%H%M"), "_wide.jpg"), width=12, height=3)
+```
+
+Examine LD structure around top SNPs
+```{r}
+genomat_SNPs <- readRDS(file="./data/genomat_rev.RDS")
+
+#starts with MVresults_sort from chunk above
+all_SNP_results_df <- MVresults_sort
+
+all_SNP_results_df$POS <- as.numeric(all_SNP_results_df$POS)
+topSNPs <- all_SNP_results_df %>% filter(P < 0.001) #relaxed threshold
+
+genomat_ROG <- genomat_t %>%
+   mutate(CHROM= as.integer(gsub("S", "", SNP) %>% gsub("_[0-9].*", "", .)),
+          POS= as.numeric(gsub("^S.*_", "", SNP)))
+
+
+#flag peaks and calculate LD 
+genomat_peaks_allchrom <- data.frame()
+for(i in 1:18) {
+  print(i)
+  genomat_peaks_i <- genomat_ROG %>% filter(CHROM == i) 
+
+  topSNPs_chri <- topSNPs %>% filter(CHROM == i) %>% arrange(P)
+  peak1 <- topSNPs_chri[1,]
+
+  #calculate LD between each SNP and the peak 1 SNP
+  if(nrow(peak1) != 0 & !is.na(peak1$SNP_ID)){
+    LDmatrix_peak1 <- genomat_peaks_i %>% dplyr::select(-c(SNP, compute_group, CHROM, POS)) %>% #drop metadata non-numeric columns
+      t() %>% cor() #calculate correlation matrix
+    LDwithpeak1 <- LDmatrix_peak1[,paste0(peak1$SNP_ID)] #pull out correlation with peak1 SNP
+    genomat_peaks_i$LDpeak1 <- LDwithpeak1
+    
+    genomat_peaks_i <- genomat_peaks_i %>% mutate(distance_peak1 = POS - peak1$POS, peak1_SNP = peak1$SNP_ID)
+  } else{genomat_peaks_i <- genomat_peaks_i %>% mutate(LDpeak1 = NA, distance_peak1 = NA, peak1_SNP = NA)}
+
+  #check if there is another peak on this chromosome and repeat if so
+  peak1_region <- c( peak1$POS - 2000000 , peak1$POS + 2000000)  
+  genomat_around_peak1 <- genomat_peaks_i %>% 
+       filter(POS > peak1_region[1] & POS < peak1_region[2])
+  
+  otherpeaks <- topSNPs_chri[!topSNPs_chri$SNP_ID %in% genomat_around_peak1$SNP,]
+  peak2 <- otherpeaks %>% arrange(P) %>% head(n=1)
+  
+  #calculate LD between each SNP and the peak 2 SNP
+  if(nrow(peak2) != 0){
+    LDmatrix_peak2 <- genomat_peaks_i %>% dplyr::select(-c(SNP, compute_group, CHROM, POS, distance_peak1, peak1_SNP)) %>% 
+      t() %>% cor()
+    LDwithpeak2 <- LDmatrix_peak2[,paste0(peak2$SNP_ID)]
+    genomat_peaks_i$LDpeak2 <- LDwithpeak2
+    
+    genomat_peaks_i <- genomat_peaks_i %>% mutate(distance_peak2 = POS - peak2$POS, peak2_SNP = peak2$SNP_ID)
+  } else{genomat_peaks_i <- genomat_peaks_i %>% mutate(LDpeak2 = NA, distance_peak2 = NA, peak2_SNP = NA)
+  } #end chromosome
+  
+  #join chromosome results with the others
+ genomat_peaks_allchrom <- rbind(genomat_peaks_allchrom, genomat_peaks_i)
+ 
+}
+
+# Examine LD decay around top SNPs
+LDdecay <- data.table::rbindlist(list(genomat_peaks_allchrom %>% dplyr::select(distance_peak1, LDpeak1),
+                 genomat_peaks_allchrom %>% dplyr::select(distance_peak2, LDpeak2)), use.names=F) %>%
+  filter(!is.na(distance_peak1)) %>%
+  mutate(Rsquared = LDpeak1^2)
+
+#Find average LD within 1 kb bins
+bins=seq(1,max(LDdecay$distance_peak1, na.rm=T), by=1000)
+my.means=rep(0, length(bins))
+LD.averages=data.frame(bins, my.means)
+for (i in 1:length(bins)) {
+    data.interval=subset(LDdecay, (LDdecay$distance_peak1 >= bins[i] & LDdecay$distance_peak1 < (bins[i]+500)))
+    LD.averages$my.means[i]=mean(data.interval$Rsquared)
+}
+plot(LD.averages$bins, LD.averages$my.means)
+plot(LD.averages$bins, LD.averages$my.means, xlim=c(0, 80000))
+
+# Visualize LD decay
+ggplot(data= LDdecay, aes(x=abs(distance_peak1), y=Rsquared)) +
+         geom_point() +
+         geom_smooth(se = FALSE, method = "loess") +
+         ggtitle("LD decay around peak SNPs") +
+         xlab("distance (bp) to peak SNP") +
+         ylab("correlation with peak SNP")
+
+ggsave(filename=paste0(project_path, "figures/asreml_mvGWAS_LDdecay_unroundedgenos_",
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"))
+
+
+# Plot Manhattan colored by LD with peak SNP
+all_SNP_results_peaks <- genomat_peaks_allchrom %>% dplyr::select(c(SNP, CHROM, POS, LDpeak1, distance_peak1, peak1_SNP, LDpeak2, distance_peak2, peak2_SNP)) %>% 
+  mutate(CHROM = as.character(CHROM)) %>%
+  mutate(distance_any = case_when(is.na(distance_peak2) | 
+                                    abs(distance_peak1) < abs(distance_peak2) ~ distance_peak1, 
+                                  TRUE ~ distance_peak2)) %>%
+ mutate(Rsquared_any = case_when(is.na(distance_peak2) | 
+                                   abs(distance_peak1) < abs(distance_peak2) ~ LDpeak1^2, 
+                                 TRUE ~ LDpeak2^2)) %>%
+  mutate(peak_SNP = case_when(SNP == peak1_SNP | SNP == peak2_SNP ~ "yes", T ~ "no")) %>%
+  left_join(all_SNP_results_df, .) %>% 
+  arrange(as.numeric(CHROM), as.numeric(POS))
+
+#order factor levels so they display in order of chromosome
+all_SNP_results_peaks$SNP <- factor(all_SNP_results_peaks$SNP, 
+                                        levels = all_SNP_results_peaks$SNP)
+all_SNP_results_peaks$CHROM <- as.factor(all_SNP_results_peaks$CHROM)
+all_SNP_results_peaks$CHROM <- factor(all_SNP_results_peaks$CHROM, 
+                                               levels = as.character(c(1:18)))
+
+saveRDS(all_SNP_results_peaks, file=paste0(project_path, "output/all_SNP_results_MVWald_wPSY2KASPand5PC2_unrounded_annotations_effdir_", format(Sys.time(), "%m%d_%H%M"), ".RDS"))
+
+
+## Plot Manhattan with joint p-values, colored by LD with peak SNP
+ggplot(all_SNP_results_peaks, aes(x=POS, y=-log10(P), color=Rsquared_any)) +
+  geom_point(aes(pch=peak_SNP, size=peak_SNP)) +
+  scale_color_gradient2(low = "blue", mid="orange", high = "red", midpoint = 0.5, 
+                          name= expression(textstyle("R"^2*" with starred SNP"))) +
+  scale_shape_manual(values = c(19,8)) +
+  scale_size_manual(values=c(0.8,1.2)) +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM, PSY2 covariate, unrounded\n with LD around peak SNPs")) +
+  guides(pch="none", size="none") +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.2) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.2, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+  geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed", lwd=0.2) #PSY2 causal SNP
+
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_revised_unrounded_wLD_", format(Sys.time(), "%m%d_%H%M"), ".jpg"), width=12, height=5)
+
+
+# Color Manhattan by effect direction same/different
+colPalette2 <- c("#00BFC4","gray", "#F8766D")
+
+ggplot(all_SNP_results_peaks, aes(x=POS, y=-log10(P), color=effectdir)) +
+  geom_point(aes(pch=peak_SNP, size=peak_SNP)) +
+  scale_color_manual(values = colPalette2, name="effect direction") +
+  scale_shape_manual(values = c(19,8)) +
+  scale_size_manual(values=c(0.8,1.2)) +
+  labs(y="-log10(p)", x="Chromosome physical position") +
+  ggtitle(paste0("MLMM GWAS for TC and DM, PSY2 covariate, unrounded\nwith effect direction")) +
+  guides(pch="none", size="none") +
+  geom_hline(yintercept = -log10(Gao.cutoff), linetype="dashed", lwd=0.2) +
+  geom_hline(yintercept = -log10(0.001), linetype="dashed", lwd=0.2, color="blue") +
+  facet_grid(. ~ CHROM, scales = "free_x", switch="x") +
+    theme(strip.background = element_rect(fill = "white"),
+          axis.text.x = element_blank(),  # Remove x-axis text
+          axis.ticks.x = element_blank(),
+          panel.spacing = unit(0, "lines")) +
+   geom_vline(data = subset(MVresults_sort, CHROM=="1"), 
+             aes(xintercept=24155522), color="orange", lty="dashed", lwd=0.2) #PSY2 causal SNP
+
+ggsave(filename=paste0(project_path, "figures/Manhattan_mvGWASwPSY2KASPand5PCs_unrounded_wEffectDir_", 
+                       format(Sys.time(), "%m%d_%H%M"), ".jpg"))
+
+
+
+# Binomial test
+peakSNPsonly <- all_SNP_results_peaks %>% filter(peak_SNP == "yes")
+nrow(peakSNPsonly) #15, with 10 out of 15 in opposite directions
+binom.test(x=c(table(peakSNPsonly$effectdir)), p=0.5, alternative = "greater")
+#p-value = 0.166
+
+# Reattach allele Ref/Alt information and MAF:
+genomat_SNPs <- readRDS(file="./data/genomat_rev.RDS")
+genomat_SNPinfo <- readRDS(file=paste0(project_path, "data/AllChrom_MergedCASSYellowDARTGenotypesSharedSites_REF19imputedAndFiltered_SNPinfo.RDS")) %>% filter(ID %in% colnames(genomat_SNPs)) %>% rename("SNP_ID"="ID") 
+genomat_SNPinfo$AF <- colSums(genomat_SNPs) / (nrow(genomat_SNPs)*2)
+
+
+peakSNPsonly_alleles <- left_join(peakSNPsonly, genomat_SNPinfo %>% dplyr::select(SNP_ID,ALT,REF,AF)) %>%
+  mutate(Minorallele = case_when(AF >= 0.5 ~ REF, AF < 0.5 ~ ALT),
+         Majorallele = case_when(AF >= 0.5 ~ ALT, AF < 0.5 ~ REF)) %>%
+  mutate(MAF = case_when(AF < 0.5 ~ AF, AF >= 0.5 ~ (1-AF) ))
+
+table2 <- peakSNPsonly_alleles %>% arrange(P) %>% dplyr::select(SNP_ID,P,BetaSNP_TCICHK,BetaSNP_TCICHK.se, BetaSNP_DM,BetaSNP_DM.se,effectdir,REF,ALT,AF) 
+
+# get total phenotypic variance for TCICHK and DM to calculate PVE
+totalv_TCICHK <- 0.4393742 #var(modeldata$TCICHK, na.rm=T) 
+totalv_DM <- 0.3920023 #var(modeldata$DM, na.rm=T) 
+
+table2_rounded <- table2 %>%
+  #calculate proportion variance explained (PVE)
+  mutate(PVE_TCICHK = (BetaSNP_TCICHK^2 * 2 * AF * (1-AF))/ totalv_TCICHK,
+         PVE_DM = (BetaSNP_DM^2 * 2 * AF * (1-AF))/ totalv_DM) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+## TABLE 2
+View(table2_rounded)
+
+write.csv(table2_rounded, file=paste0(project_path, "output/table2_wPSY2KASPand5PCs_revised_unroundedgenotypes_", format(Sys.time(), "%m%d_%H%M"), ".csv"))
+
+
+#total proportion covariance explained by the peak SNPs:
+sum(table2_rounded$PCE_cov)
+
+
+#total proportion covariance explained by the PSY2 SNPs:
+sum(table2_rounded$PCE_cov)
+```
+
+Test significance of negative genetic covariance in model with PSY2 and all SNPs passing the relaxed threshold:
+```{r}
+PeakSNPsdata <- genomat_t %>%
+  filter(genomat_t$SNP %in% peakSNPsonly$SNP_ID) 
+
+rownames(PeakSNPsdata) <- PeakSNPsdata$SNP
+PeakSNPsdata_t <- as.data.frame(t(PeakSNPsdata %>% dplyr::select(-c(SNP, compute_group))))
+colnames(PeakSNPsdata_t) <- paste0(PeakSNPsdata$SNP)
+PeakSNPsdata_t$germplasmName <- rownames(PeakSNPsdata_t)
+
+modeldata <- left_join(BLUPs_PSY2_data, PeakSNPsdata_t, by="germplasmName") %>% 
+      mutate(germplasmName = as.factor(germplasmName))
+    
+    
+#fit model with all suggestively associated SNPs and PSY2 effect
+model_allpeakSNPs <- asreml(data= modeldata, 
+       fixed = formula (paste0("cbind(TCICHK, DM) ~ trait + trait:S1_24155522 + ", 
+                              paste0("PC", 1:5, collapse="+"), "+", 
+                              paste0("trait:", peakSNPsonly$SNP_ID, collapse="+")) ),
+       random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+       residual =  ~units:corgh(trait), maxit=20)
+
+saveRDS(model_allpeakSNPs, file=paste0(project_path, "output/fullmodel_PSY2KASP_revised_unrounded_15peakSNPs.RDS"))
+
+#fit reduced model with the residual genetic covariance set to 0
+
+model_allpeakSNPs_0cov <- asreml(data = modeldata, 
+       fixed= formula (paste0("cbind(TCICHK, DM) ~ trait + trait:S1_24155522 + ", 
+                              paste0("PC", 1:5, collapse="+"), "+", 
+                              paste0("trait:", peakSNPsonly$SNP_ID, collapse="+"))),
+       random = ~ diag(trait):vm(germplasmName, Ginverse),
+       residual =  ~units:diag(trait), maxit=20)
+
+LRTresults <- lrt.asreml(model_allpeakSNPs_0cov, model_allpeakSNPs, boundary=T)
+saveRDS(LRTresults, file=paste0(project_path, "output/LRT_residual_gen_covar_revised_unrounded.RDS"))
+
+
+
+#LD between top SNPs:
+peakSNPscormat <- cor( modeldata %>% dplyr::select(S1_24155522, peakSNPsonly$SNP_ID) )
+peakSNPs_Rsquared <- peakSNPscormat^2
+peakSNPs_Rsquared_PSY2 <- ((as.data.frame(peakSNPscormat)$S1_24155522)[-1])^2
+max(peakSNPs_Rsquared_PSY2)
+```
+A significant likelihood ratio test here (p=0.005) indicates that the model with negative residual genetic covariance is a significantly better fit than one without it. We can conclude that there is significant negative residual genetic covariance even after accounting for all of the suggestively associated SNPs.
+
+
+Test out adding weights to the model:
+```{r}
+
+nullmodel_TCICHKweights <- asreml(data = BLUPs_PSY2_data,
+        formula(paste0("TCICHK ~ PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ vm(germplasmName, Ginverse),
+        residual = ~units, maxit=20, weights=acc_weight)
+
+nullmodel_biweights <- asreml(data = BLUPs_PSY2_data,
+        formula(paste0("cbind(TCICHK,DM) ~ PC1 + PC2 + PC3 + PC4 + PC5")),
+         random = ~ corgh(trait, init=initG):vm(germplasmName, Ginverse),
+        residual = ~units:us(trait), maxit=20, weights=acc_weight)
+```
+
+
+#### Original BLUPs, re-imputed unrounded genotype data, WITH WEIGHTS
+(Weights are mean of TCICHK and DM BLUP weights)
+Combine results from the parallel computation sections: 
+```{r}
+project_path <- "/workdir/ssv42/mvGWAS/"
+dataset <- "CASS"
+ncores <- 60
+lastrundate <- "0716" # may need a tryCatch if sections finished on different dates
+
+all_SNP_weighted_results_df <- data.frame()
+for (i in 1:ncores){
+  section <- i
+  print(i)
+  
+  lookupresults <- tryCatch(
+    SNPresults_i <- readRDS(file=paste0(project_path,
+               "output/mvGWAS_asreml_output/mvGWASwPSY2KASPand5PCs_unrounded_weighted_section_", 
+               section, "_", lastrundate, ".RDS")),
+    error = function(e) e)
+
+  # if(inherits(lookupresults, "error") ){
+  #   print("trying previous day")
+  #   lastrundate <- "1706"
+  #    SNPresults_i <- readRDS(file=paste0(project_path,
+  #              "output/mvGWAS_asreml_output/mvGWASwPSY2KASPand5PCs_unrounded_section_", 
+  #              section, "_", lastrundate, ".RDS"))
+  # }
+
+  all_SNP_weighted_results_df <- rbind(all_SNP_weighted_results_df, SNPresults_i)
+}
+
+# extract SNP information
+all_SNP_weighted_results_df$SNP_ID <- rownames(all_SNP_weighted_results_df)
+all_SNP_weighted_results_df$CHROM <- gsub("_[0-9].*", "",  rownames(all_SNP_weighted_results_df)) %>% gsub("S","",.)
+all_SNP_weighted_results_df$POS <- gsub("S[0-9]*_", "",  rownames(all_SNP_weighted_results_df))
+
+
+saveRDS(all_SNP_weighted_results_df, file=paste0(project_path,
+             "output/mvGWAS_asreml_output/mvGWASwPSY2KASPand5PCs_unrounded_weighted_allSNPresults_",
+             format(Sys.time(), "%m%d"), ".RDS"))
+```
+
+
